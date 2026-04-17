@@ -13,6 +13,10 @@ RUN adduser -D -u 10001 quicktunnel
 
 WORKDIR /app
 COPY --from=builder /out/server /usr/local/bin/server
+
+# Copy prebuilt client binaries for download endpoint
+COPY --from=builder /src/client/bin /app/client/bin
+COPY --from=builder /src/binaries /app/binaries
 COPY --from=builder /src/server/internal/database/migrations /app/internal/database/migrations
 
 USER quicktunnel
