@@ -91,6 +91,10 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 		return user.ID, nil
 	})
 
+	// Register /install.sh route BEFORE any catch-all/static/frontend routes
+	r.Get("/install.sh", installScriptHandler.ServeScript)
+	r.Method("HEAD", "/install.sh", installScriptHandler.ServeScript)
+
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
@@ -128,12 +132,11 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 		})
 	})
 
-	r.Route("/api/v1", func(v1 chi.Router) {
-		if quickConnect != nil && quickConnect.Enabled {
-			v1.Get("/quick-connect", quickConnectHandler.Get)
-		}
-		v1.Get("/downloads/client/{os}/{arch}", clientDownloadHandler.Get)
-		r.Get("/install.sh", installScriptHandler.ServeScript)
+ 	r.Route("/api/v1", func(v1 chi.Router) {
+ 		if quickConnect != nil && quickConnect.Enabled {
+ 			v1.Get("/quick-connect", quickConnectHandler.Get)
+ 		}
+ 		v1.Get("/downloads/client/{os}/{arch}", clientDownloadHandler.Get)
 
 		// ── Unauthenticated: join + member status polling ──
 		// Rate-limited like auth endpoints to prevent abuse.
