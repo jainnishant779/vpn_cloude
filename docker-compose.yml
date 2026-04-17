@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: quicktunnel-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quicktunnel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quicktunnel}
+      POSTGRES_DB: ${POSTGRES_DB:-quicktunnel}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quicktunnel} -d ${POSTGRES_DB:-quicktunnel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: quicktunnel-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: quicktunnel-server
+    environment:
+      DB_URL: ${DB_URL:-postgres://quicktunnel:quicktunnel@postgres:5432/quicktunnel?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      SERVER_PORT: ${SERVER_PORT:-8080}
+      STUN_SERVER: ${STUN_SERVER:-stun.l.google.com:19302}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  relay:
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+    container_name: quicktunnel-relay
+    environment:
+      RELAY_PORT: ${RELAY_PORT:-3478}
+      HEALTH_PORT: ${HEALTH_PORT:-8081}
+      COORD_SERVER_URL: ${COORD_SERVER_URL:-http://server:8080}
+      RELAY_NAME: ${RELAY_NAME:-relay-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${RELAY_PORT:-3478}:3478/udp"
+      - "${HEALTH_PORT:-8081}:8081"
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    container_name: quicktunnel-web
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    depends_on:
+      server:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
