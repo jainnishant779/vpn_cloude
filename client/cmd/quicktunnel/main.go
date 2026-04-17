@@ -34,6 +34,8 @@ func main() {
 
 	var err error
 	switch command {
+	case "join":
+		err = runJoin(args)
 	case "up":
 		err = runUp(args)
 	case "down":
@@ -60,6 +62,100 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runJoin joins a network in one step — no config file required beforehand.
+// Usage: quicktunnel join --server <url> --network <id> --api-key <key>
+//        quicktunnel join --server <url> --network <id> --email <e> --password <p>
+func runJoin(args []string) error {
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	server   := fs.String("server",   "", "QuickTunnel server URL  (e.g. http://54.89.232.16:3000)")
+	network  := fs.String("network",  "", "Network ID to join       (shown in dashboard)")
+	apiKey   := fs.String("api-key",  "", "API key from dashboard   (Client setup details)")
+	email    := fs.String("email",    "", "Account email            (alternative to --api-key)")
+	password := fs.String("password", "", "Account password         (alternative to --api-key)")
+	name     := fs.String("name",     "", "Device name              (optional, defaults to hostname)")
+	noStart  := fs.Bool("no-start",   false, "Save config only, do not start the agent")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("join: parse flags: %w", err)
+	}
+
+	if strings.TrimSpace(*server) == "" {
+		return fmt.Errorf("join: --server is required (e.g. http://54.89.232.16:3000)")
+	}
+	if strings.TrimSpace(*network) == "" {
+		return fmt.Errorf("join: --network is required (copy it from the dashboard)")
+	}
+
+	cfg := &config.Config{
+		ServerURL:    strings.TrimSpace(*server),
+		NetworkID:    strings.TrimSpace(*network),
+		LogLevel:     "info",
+		WGListenPort: 51820,
+		STUNServer:   "stun.l.google.com:19302",
+	}
+	if strings.TrimSpace(*name) != "" {
+		cfg.DeviceName = strings.TrimSpace(*name)
+	}
+
+	// Resolve API key — either directly supplied or obtained via login.
+	switch {
+	case strings.TrimSpace(*apiKey) != "":
+		cfg.APIKey = strings.TrimSpace(*apiKey)
+
+	case strings.TrimSpace(*email) != "" && strings.TrimSpace(*password) != "":
+		client := api_client.NewClient(cfg.ServerURL, "")
+		resp, err := client.Login(*email, *password)
+		if err != nil {
+			return fmt.Errorf("join: login failed: %w", err)
+		}
+		cfg.APIKey = resp.APIKey
+		cfg.Email = strings.TrimSpace(*email)
+		cfg.Password = strings.TrimSpace(*password)
+		fmt.Printf("Logged in as %s\n", resp.User.Email)
+
+	default:
+		return fmt.Errorf("join: supply either --api-key OR both --email and --password")
+	}
+
+	if err := config.Save(cfg); err != nil {
+		return fmt.Errorf("join: save config: %w", err)
+	}
+	fmt.Printf("Config saved  ->  server=%s  network=%s\n", cfg.ServerURL, cfg.NetworkID)
+
+	if *noStart {
+		fmt.Println("Skipping agent start (--no-start). Run 'quicktunnel up' when ready.")
+		return nil
+	}
+
+	fmt.Println("Starting agent... (Ctrl+C to stop)")
+	configureLogging(cfg.LogLevel)
+
+	ag := agent.NewAgent(cfg)
+	ag.OnStateChange(func(from agent.AgentState, to agent.AgentState) {
+		log.Info().Str("from", string(from)).Str("to", string(to)).Msg("agent state changed")
+	})
+
+	if err := ag.Start(); err != nil {
+		return fmt.Errorf("join: start agent: %w", err)
+	}
+	defer ag.Stop()
+
+	if err := writePIDFile(os.Getpid()); err != nil {
+		log.Warn().Err(err).Msg("failed to write pid file")
+	}
+	defer removePIDFile()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	<-sigCh
+	log.Info().Msg("shutdown signal received")
+	if err := ag.Stop(); err != nil {
+		return fmt.Errorf("join: stop agent: %w", err)
+	}
+	return nil
 }
 
 func runUp(args []string) error {
@@ -338,6 +434,9 @@ func printUsage() {
 	fmt.Println("QuickTunnel CLI")
 	fmt.Println("")
 	fmt.Println("Usage:")
+	fmt.Println("  quicktunnel join --server <url> --network <id> --api-key <key>")
+	fmt.Println("  quicktunnel join --server <url> --network <id> --email <email> --password <pass>")
+	fmt.Println("")
 	fmt.Println("  quicktunnel up")
 	fmt.Println("  quicktunnel down")
 	fmt.Println("  quicktunnel status")
@@ -345,6 +444,15 @@ func printUsage() {
 	fmt.Println("  quicktunnel vnc <peer-name>")
 	fmt.Println("  quicktunnel login --email <email> --password <password>")
 	fmt.Println("  quicktunnel config [--set key=value]")
+	fmt.Println("")
+	fmt.Println("Join flags:")
+	fmt.Println("  --server    Server URL, e.g. http://54.89.232.16:3000")
+	fmt.Println("  --network   Network ID from the dashboard")
+	fmt.Println("  --api-key   API key from Client setup details on the dashboard")
+	fmt.Println("  --email     Account email (auto-fetches API key)")
+	fmt.Println("  --password  Account password (used with --email)")
+	fmt.Println("  --name      Optional device name")
+	fmt.Println("  --no-start  Save config only; do not start the agent")
 }
 
 func printJSON(value any) error {
