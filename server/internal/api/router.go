@@ -77,6 +77,9 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 	quickConnectHandler := NewQuickConnectHandler(quickConnect)
 	clientDownloadHandler := NewClientDownloadHandler()
 
+	serverPublicURL := GetServerURL() // reads PUBLIC_SERVER_URL env var
+	installScriptHandler := NewInstallScriptHandler(serverPublicURL)
+
 	apiKeyAuth := auth.NewAPIKeyAuth(func(ctx context.Context, apiKey string) (string, error) {
 		user, err := userStore.GetUserByAPIKey(ctx, apiKey)
 		if err != nil {
@@ -130,6 +133,7 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			v1.Get("/quick-connect", quickConnectHandler.Get)
 		}
 		v1.Get("/downloads/client/{os}/{arch}", clientDownloadHandler.Get)
+		r.Get("/install.sh", installScriptHandler.ServeScript)
 
 		// ── Unauthenticated: join + member status polling ──
 		// Rate-limited like auth endpoints to prevent abuse.
