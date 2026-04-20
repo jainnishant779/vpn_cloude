@@ -1,0 +1,16 @@
+.git
+.agent/
+.ralphy/
+__pycache__/
+*.pyc
+*.log
+*.zip
+*.tar
+*.tar.gz
+go1.22.1.linux-amd64.tar.gz
+docs/
+tests/
+dist/
+web/node_modules/
+web/dist/
+.env

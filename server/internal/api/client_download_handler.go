@@ -74,13 +74,16 @@ var supportedClientBinaries = map[string]clientBinarySpec{
 // ClientDownloadHandler serves cached or on-demand-built client binaries.
 type ClientDownloadHandler struct {
 	projectRoot string
+	binaryDirs  []string
 	buildBinary func(spec clientBinarySpec, targetPath string) error
 	buildMu     sync.Mutex
 }
 
 func NewClientDownloadHandler() *ClientDownloadHandler {
+	projectRoot := discoverProjectRoot()
 	h := &ClientDownloadHandler{
-		projectRoot: discoverProjectRoot(),
+		projectRoot: projectRoot,
+		binaryDirs:  discoverBinaryDirs(projectRoot),
 	}
 	h.buildBinary = h.defaultBuildBinary
 	return h
@@ -140,19 +143,19 @@ func computeFileSHA256(path string) (string, error) {
 }
 
 func (h *ClientDownloadHandler) ensureBinary(spec clientBinarySpec) (string, error) {
-	if h.projectRoot == "" {
-		return "", fmt.Errorf("client downloads are unavailable on this server host")
-	}
-
-	targetPath := filepath.Join(h.projectRoot, "client", "bin", spec.Filename)
-	if fileExists(targetPath) {
+	if targetPath := h.findExistingBinary(spec); targetPath != "" {
 		return targetPath, nil
 	}
 
+	if h.projectRoot == "" {
+		return "", fmt.Errorf("client binary %s is unavailable on this server host", spec.Filename)
+	}
+
+	targetPath := filepath.Join(h.projectRoot, "client", "bin", spec.Filename)
 	h.buildMu.Lock()
 	defer h.buildMu.Unlock()
 
-	if fileExists(targetPath) {
+	if targetPath := h.findExistingBinary(spec); targetPath != "" {
 		return targetPath, nil
 	}
 
@@ -178,6 +181,32 @@ func (h *ClientDownloadHandler) ensureBinary(spec clientBinarySpec) (string, err
 	}
 
 	return targetPath, nil
+}
+
+func (h *ClientDownloadHandler) findExistingBinary(spec clientBinarySpec) string {
+	dirs := h.binaryDirs
+	if len(dirs) == 0 && h.projectRoot != "" {
+		dirs = discoverBinaryDirs(h.projectRoot)
+	}
+
+	seen := map[string]struct{}{}
+	for _, dir := range dirs {
+		cleaned := filepath.Clean(strings.TrimSpace(dir))
+		if cleaned == "" {
+			continue
+		}
+		if _, ok := seen[cleaned]; ok {
+			continue
+		}
+		seen[cleaned] = struct{}{}
+
+		targetPath := filepath.Join(cleaned, spec.Filename)
+		if fileExists(targetPath) {
+			return targetPath
+		}
+	}
+
+	return ""
 }
 
 func (h *ClientDownloadHandler) defaultBuildBinary(spec clientBinarySpec, targetPath string) error {
@@ -256,6 +285,40 @@ func discoverProjectRoot() string {
 	}
 
 	return ""
+}
+
+func discoverBinaryDirs(projectRoot string) []string {
+	candidates := []string{}
+
+	if projectRoot != "" {
+		candidates = append(candidates,
+			filepath.Join(projectRoot, "client", "bin"),
+			filepath.Join(projectRoot, "binaries"),
+		)
+	}
+
+	if cwd, err := os.Getwd(); err == nil {
+		parent := filepath.Dir(cwd)
+		candidates = append(candidates,
+			filepath.Join(cwd, "client", "bin"),
+			filepath.Join(cwd, "binaries"),
+			filepath.Join(parent, "client", "bin"),
+			filepath.Join(parent, "binaries"),
+		)
+	}
+
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		parent := filepath.Dir(exeDir)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "client", "bin"),
+			filepath.Join(exeDir, "binaries"),
+			filepath.Join(parent, "client", "bin"),
+			filepath.Join(parent, "binaries"),
+		)
+	}
+
+	return candidates
 }
 
 func fileExists(path string) bool {

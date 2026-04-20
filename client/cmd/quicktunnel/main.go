@@ -2,13 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	
+
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -17,11 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	pkgcrypto "quicktunnel.local/pkg/crypto"
 	"quicktunnel/client/internal/agent"
 	"quicktunnel/client/internal/api_client"
 	"quicktunnel/client/internal/config"
 	"quicktunnel/client/internal/vnc"
-	pkgcrypto "quicktunnel.local/pkg/crypto"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -74,9 +73,10 @@ func main() {
 
 // normalizeServerURL turns a bare IP or IP:port into a proper http:// URL.
 // Examples:
-//   54.89.232.16         → http://54.89.232.16:3000
-//   54.89.232.16:8080    → http://54.89.232.16:8080
-//   http://example.com   → http://example.com  (unchanged)
+//
+//	54.89.232.16         -> http://54.89.232.16:3000
+//	54.89.232.16:8080    -> http://54.89.232.16:8080
+//	http://example.com   -> http://example.com  (unchanged)
 func normalizeServerURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
@@ -89,7 +89,7 @@ func normalizeServerURL(raw string) string {
 	return "http://" + raw
 }
 
-// ─── ZeroTier-style join ─────────────────────────────────────────────────────
+// ZeroTier-style join
 //
 // Usage:
 //   quicktunnel join <server>  <network_id>
@@ -103,9 +103,9 @@ func runJoin(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf(
 			"Usage: quicktunnel join <server> <network_id>\n" +
-			"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh\n\n" +
-			"  server     — EC2 IP or URL (port 3000 is default)\n" +
-			"  network_id — from the dashboard")
+				"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh\n\n" +
+				"  server     - EC2 IP or URL (port 3000 is default)\n" +
+				"  network_id - from the dashboard")
 	}
 
 	serverURL := normalizeServerURL(args[0])
@@ -132,7 +132,7 @@ func runJoin(args []string) error {
 		deviceName = "unknown-device"
 	}
 
-	// POST /api/v1/join  — NO auth required
+	// POST /api/v1/join - no auth required.
 	type joinReq struct {
 		NetworkID   string `json:"network_id"`
 		Hostname    string `json:"hostname"`
@@ -191,9 +191,9 @@ func runJoin(args []string) error {
 	}
 	fmt.Printf("status=%s\n", jr.Status)
 
-	// If pending — poll until approved or rejected
+	// If pending, poll until approved or rejected.
 	if jr.Status == "pending" {
-		fmt.Printf("⏳ Waiting for admin to approve in dashboard (network: %s)...\n", jr.NetworkName)
+		fmt.Printf("Waiting for admin to approve in dashboard (network: %s)...\n", jr.NetworkName)
 		fmt.Println("   Press Ctrl+C to cancel.")
 
 		type statusEnvelope struct {
@@ -224,7 +224,7 @@ func runJoin(args []string) error {
 				case "approved":
 					jr.Status = "approved"
 					jr.VirtualIP = se.Data.VirtualIP
-					fmt.Println("✓ Approved!")
+					fmt.Println("Approved!")
 					goto approved
 				case "rejected":
 					return fmt.Errorf("join: your device was rejected by the network admin")
@@ -239,8 +239,8 @@ approved:
 		return fmt.Errorf("join: unexpected status: %s", jr.Status)
 	}
 
-	fmt.Printf("✓ Virtual IP : %s\n", jr.VirtualIP)
-	fmt.Printf("✓ Network    : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
+	fmt.Printf("Virtual IP : %s\n", jr.VirtualIP)
+	fmt.Printf("Network    : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
 
 	// Save config
 	cfg := &config.Config{
@@ -257,7 +257,7 @@ approved:
 	if err := config.Save(cfg); err != nil {
 		return fmt.Errorf("join: save config: %w", err)
 	}
-	fmt.Println("✓ Config saved to ~/.quicktunnel/config.json")
+	fmt.Println("Config saved to ~/.quicktunnel/config.json")
 	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)")
 
 	return startAgent(cfg)
@@ -381,7 +381,7 @@ func runVNC(args []string) error {
 			if err := vnc.LaunchVNCViewer(p.VirtualIP, port); err != nil {
 				return fmt.Errorf("vnc: launch viewer: %w", err)
 			}
-			fmt.Printf("VNC → %s (%s:%d)\n", p.Name, p.VirtualIP, port)
+			fmt.Printf("VNC -> %s (%s:%d)\n", p.Name, p.VirtualIP, port)
 			return nil
 		}
 	}
@@ -458,9 +458,9 @@ func runConfig(args []string) error {
 }
 
 func printUsage() {
-	fmt.Println("QuickTunnel — ZeroTier-style VPN")
+	fmt.Println("QuickTunnel - ZeroTier-style VPN")
 	fmt.Println("")
-	fmt.Println("CONNECT (no binary needed — runs the one-liner first):")
+	fmt.Println("CONNECT (no binary needed - runs the one-liner first):")
 	fmt.Println("  curl http://<server>/join/<network_id> | sudo bash")
 	fmt.Println("")
 	fmt.Println("OR if already installed:")
@@ -468,11 +468,11 @@ func printUsage() {
 	fmt.Println("  quicktunnel join 54.89.232.16 5agrlxob7exh")
 	fmt.Println("")
 	fmt.Println("COMMANDS:")
-	fmt.Println("  join   <server> <network_id>  — connect to a network")
-	fmt.Println("  leave  / down                 — disconnect")
-	fmt.Println("  status                        — show connection info")
-	fmt.Println("  peers                         — list network peers")
-	fmt.Println("  up                            — reconnect (uses saved config)")
+	fmt.Println("  join   <server> <network_id>  - connect to a network")
+	fmt.Println("  leave  / down                 - disconnect")
+	fmt.Println("  status                        - show connection info")
+	fmt.Println("  peers                         - list network peers")
+	fmt.Println("  up                            - reconnect (uses saved config)")
 	fmt.Println("")
 	fmt.Println("  server   = EC2 IP (port 3000 is default) or full URL")
 	fmt.Println("  network  = ID from the dashboard")
@@ -533,6 +533,5 @@ func removePIDFile() {
 
 func init() {
 	time.Local = time.UTC
-
 
 }

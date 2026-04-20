@@ -45,6 +45,7 @@ func TestClientDownloadHandlerBuildsOnDemand(t *testing.T) {
 
 	handler := &ClientDownloadHandler{
 		projectRoot: tempDir,
+		binaryDirs:  []string{filepath.Join(tempDir, "client", "bin")},
 	}
 	handler.buildBinary = func(spec clientBinarySpec, targetPath string) error {
 		return os.WriteFile(targetPath, []byte("built-data"), 0o755)
@@ -61,6 +62,34 @@ func TestClientDownloadHandlerBuildsOnDemand(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "built-data", rec.Body.String())
 	require.FileExists(t, filepath.Join(tempDir, "client", "bin", "quicktunnel-linux-amd64"))
+}
+
+func TestClientDownloadHandlerServesRuntimeBinaryDir(t *testing.T) {
+	tempDir := t.TempDir()
+	runtimeDir := filepath.Join(tempDir, "client", "bin")
+	target := filepath.Join(runtimeDir, "quicktunnel-linux-amd64")
+
+	require.NoError(t, os.MkdirAll(runtimeDir, 0o755))
+	require.NoError(t, os.WriteFile(target, []byte("runtime-data"), 0o755))
+
+	handler := &ClientDownloadHandler{
+		binaryDirs: []string{runtimeDir},
+	}
+	handler.buildBinary = func(spec clientBinarySpec, targetPath string) error {
+		t.Fatalf("build should not run when runtime artifact already exists")
+		return nil
+	}
+
+	router := chi.NewRouter()
+	router.Get("/api/v1/downloads/client/{os}/{arch}", handler.Get)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/downloads/client/linux/amd64", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "runtime-data", rec.Body.String())
 }
 
 func TestClientDownloadHandlerRejectsUnsupportedPlatform(t *testing.T) {
