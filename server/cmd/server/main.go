@@ -34,17 +34,24 @@ func main() {
 
 	ctx := context.Background()
 
-	db, err := database.NewPostgresDB(cfg.DBURL)
+	// ── Database ──────────────────────────────────────────────────────────────
+	poolCfg := database.PoolConfig{
+		MaxConns:        int32(cfg.DBMaxConns),
+		MinConns:        int32(cfg.DBMinConns),
+		MaxConnLifetime: cfg.DBMaxConnLifetime,
+		MaxConnIdleTime: cfg.DBMaxConnIdleTime,
+	}
+	db, err := database.NewPostgresDB(cfg.DBURL, poolCfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to postgres")
 	}
 	defer db.Close()
 
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	redisOptions, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to parse redis url")
 	}
-
 	redisClient := redis.NewClient(redisOptions)
 	defer redisClient.Close()
 
@@ -52,22 +59,43 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to connect to redis")
 	}
 
+	// ── Migrations ────────────────────────────────────────────────────────────
 	if err := db.Migrate(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to run migrations")
 	}
-
 	if *migrateOnly {
 		log.Info().Msg("migrations completed successfully")
 		return
 	}
 
+	// ── JWT ───────────────────────────────────────────────────────────────────
 	jwtService, err := auth.NewJWTService(cfg.JWTSecret)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize jwt service")
 	}
 
-	router := api.SetupRouter(db, redisClient, jwtService)
+	// ── Quick Connect Bootstrap (simple mode) ─────────────────────────────────
+	var quickConnect *api.QuickConnectBootstrap
+	if cfg.SimpleModeEnabled {
+		quickConnect = &api.QuickConnectBootstrap{
+			Enabled:     true,
+			NetworkName: cfg.SimpleNetworkName,
+			CIDR:        cfg.SimpleNetworkCIDR,
+			MaxPeers:    cfg.SimpleNetworkMaxPeers,
+		}
+	}
 
+	// ── Router ────────────────────────────────────────────────────────────────
+	router := api.SetupRouter(
+		db,
+		redisClient,
+		jwtService,
+		quickConnect,
+		cfg.AllowedOrigins,
+		cfg.TrustedProxies,
+	)
+
+	// ── HTTP server ───────────────────────────────────────────────────────────
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler:           router,
@@ -101,11 +129,7 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error().Err(err).Msg("http server shutdown failed")
 	}
-
-	if err := redisClient.Close(); err != nil {
-		log.Error().Err(err).Msg("redis close failed")
-	}
-
+	_ = redisClient.Close()
 	db.Close()
 	log.Info().Msg("quicktunnel server stopped")
 }
