@@ -1,98 +1,99 @@
 # QuickTunnel VNC
 
-QuickTunnel VNC is a peer-to-peer VPN platform optimized for VNC remote desktop traffic.
-It combines a coordination control plane, regional relay fallback, and WireGuard-based encrypted tunnels between peers.
+QuickTunnel VNC is a peer-to-peer VPN platform optimized for VNC remote desktop traffic. It combines a coordination control plane, regional relay fallback, and WireGuard-based encrypted tunnels between peers seamlessly.
 
-## Highlights
+## Key Features
 
-- Encrypted peer-to-peer connectivity for device-to-device VNC access
-- Relay fallback when NAT traversal cannot establish direct paths
-- Coordination APIs for peer discovery, endpoint announce, and relay assignment
-- Cross-platform client architecture (Linux, Windows, macOS)
-- Web dashboard for network and peer operations
+- **ZeroTier-Style Networks**: Effortlessly join devices to a centrally managed network via a single CLI command or bash one-liner.
+- **Admin Approval Workflow**: Devices joining a network wait in a `pending` state until an admin approves them directly from the web dashboard.
+- **Encrypted Peer-to-Peer**: Direct device-to-device connectivity using WireGuard for secure and fast VNC or data access.
+- **Relay Fallback**: Automatic UDP relay fallback when standard NAT traversal (hole punching) cannot establish a direct path.
+- **VNC Auto-Discovery**: Automatically discovers locally running VNC servers and seamlessly proxies them over the encrypted tunnel.
+- **Web Dashboard**: React + TypeScript administration panel for managing networks, viewing peers, and approving joining devices.
+- **Cross-Platform**: Support for Linux, Windows, and macOS agents.
 
 ## Repository Layout
 
-- `server/`: Control plane API, auth, DB access, coordination services
-- `relay/`: UDP relay for fallback data transport
-- `client/`: Agent runtime, NAT traversal, tunnel and peer management
-- `web/`: React + TypeScript dashboard
-- `pkg/`: Shared protocol, crypto, and net utilities
-- `tests/e2e/`: End-to-end full-flow integration test harness
-- `docs/`: Setup, architecture, API, protocol, and troubleshooting guides
+- `server/`: Go-based Control Plane API handling auth, networking lifecycle, coord APIs, and PostgreSQL database migrations.
+- `relay/`: High-performance Go UDP relay for fallback data transport when P2P hole-punching fails.
+- `client/`: Go agent runtime for NAT traversal, tunnel establishment, peer management, and VNC discovery.
+- `web/`: React + TypeScript frontend dashboard for comprehensive network and access management.
+- `pkg/`: Shared utility packages including protocol mapping, modern encryption, and network operations.
+- `tests/e2e/`: End-to-end full network flow integration tests.
 
-## Quick Start
+## Getting Started (Docker Compose)
 
-1. Configure environment variables:
+The easiest way to get the entire QuickTunnel stack (Server, Relay, Postgres, Redis, Web Dashboard) running is via Docker Compose:
 
-   - Copy `.env.example` and customize values.
+```bash
+# 1. Configure environment variables
+cp .env.example .env
 
-2. Start dependencies:
+# 2. Build and run the entire stack
+docker compose up --build -d
+```
 
-   - `docker compose up -d postgres redis`
+Services exposed:
+- Web Dashboard: `http://localhost:3000`
+- API Server: `http://localhost:8080`
+- Relay Health: `http://localhost:8081`
+- Relay UDP: `3478/udp`
 
-3. Build server and relay:
+## Connecting Devices (Client)
 
-   - `make build-server`
-   - `make build-relay`
+Once your server is running and you have created a network via the dashboard (giving you a `Network ID` like `5agrlxob7exh`), you can connect client devices in multiple ways.
 
-4. Start server:
+### Option 1: The One-Liner (Linux/macOS)
+If you do not have the agent binary installed yet, you can use the curl installer which automatically downloads the correct binary and joins the network:
 
-   - `cd server && go run ./cmd/server`
+```bash
+curl http://<server-ip>:8080/join/<network-id> | sudo bash
+```
 
-5. Start relay:
+### Option 2: Using the CLI explicitly
+If you already have the QuickTunnel binary downloaded and in your path:
 
-   - `cd relay && go run ./cmd/relay`
+```bash
+quicktunnel join <server-ip>:8080 <network-id>
+```
 
-6. Build and run client:
+> **Note**: Both methods will place the device in a `pending` state. An admin must log in to the Web Dashboard and approve the device. Once approved, the agent will receive a Virtual IP and immediately establish encrypted tunnel connections to other peers in the network.
 
-   - `cd client && go run ./cmd/quicktunnel up`
+## CLI Commands Reference
 
-7. Run web dashboard:
+- `quicktunnel join <server> <network_id>` - Join a network and wait for approval.
+- `quicktunnel up` - Reconnect to the network using the saved configuration.
+- `quicktunnel down` / `leave` - Disconnect from the active ZeroTier network.
+- `quicktunnel status` - Show live active connection and peer status.
+- `quicktunnel peers` - List all other approved and online peers in your network.
+- `quicktunnel vnc <peer-name>` - Automatically open a VNC viewer connected over the secure tunnel to the specific peer.
+- `quicktunnel config` - View or set manual configuration overrides.
 
-   - `cd web && npm install && npm run dev`
+## Local Development (Without Compose)
 
-## Easy Launcher
+For backend/client developers who wish to run services locally outside of docker:
 
-Use the root launcher to run core flows with a single command.
+```bash
+# Start required DB dependencies
+docker compose up -d postgres redis
 
-1. Start server (and postgres/redis dependencies):
+# Terminal 1: Run the API Server
+cd server && go run ./cmd/server
 
-   - `python main.py server`
+# Terminal 2: Run the Relay Server
+cd relay && go run ./cmd/relay
 
-2. Join a network with API key:
+# Terminal 3: Run the Web Dashboard
+cd web && npm install && npm run dev
+```
 
-   - `python main.py join --network-id <network-id> --api-key <api-key>`
+## Available Documentation
 
-3. One-shot local stack (deps + server + relay + join):
-
-   - `python main.py all --network-id <network-id> --api-key <api-key>`
-
-Email login is also supported for `join` and `all`:
-
-- `--email <email> --password <password>`
-
-## Full Stack Compose
-
-To build and run full stack (Postgres, Redis, server, relay, web):
-
-- `docker compose up --build`
-
-## Testing
-
-- Unit tests (per module):
-  - `cd server && go test ./...`
-  - `cd relay && go test ./...`
-  - `cd client && go test ./...`
-
-- E2E flow test:
-  - `go test -tags e2e ./tests/e2e/...`
-
-## Documentation
+Detailed implementation logic and design architecture can be found in the `docs/` directory:
 
 - [Documentation Overview](DOCUMENTATION_OVERVIEW.md)
-- [Setup Guide](docs/setup.md)
 - [Architecture](docs/architecture.md)
 - [API Reference](docs/api.md)
 - [Protocol](docs/protocol.md)
+- [Setup Guide](docs/setup.md)
 - [Troubleshooting](docs/troubleshooting.md)
