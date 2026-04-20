@@ -114,7 +114,7 @@ INSERT INTO peers (
     network_id, name, machine_id, public_key, virtual_ip, public_endpoint,
     local_endpoints, os, version, is_online, vnc_port, vnc_available, status, member_token
 )
-VALUES ($1, $2, $3, $4, COALESCE(NULLIF($5, ''), '0.0.0.0'), $6, COALESCE($7, '{}'::text[]),
+VALUES ($1, $2, $3, $4, COALESCE(NULLIF($5, '')::inet, '0.0.0.0'::inet), $6, COALESCE($7, '{}'::text[]),
         $8, $9, false, $10, false, $11, $12)
 ON CONFLICT (machine_id)
 DO UPDATE SET
