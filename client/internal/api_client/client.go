@@ -274,7 +274,10 @@ func (c *Client) Announce(endpoint AnnounceRequest) error {
 	if !c.hasAPIKey() {
 		memberID, memberToken := c.memberAuth()
 		if memberID != "" && memberToken != "" {
-			// Member-auth flow piggybacks endpoint updates in heartbeat.
+			path := fmt.Sprintf("/api/v1/members/%s/announce", url.PathEscape(memberID))
+			if err := c.doJSON(context.Background(), http.MethodPost, path, endpoint, authMemberToken, nil); err != nil {
+				return fmt.Errorf("announce (member): %w", err)
+			}
 			return nil
 		}
 	}

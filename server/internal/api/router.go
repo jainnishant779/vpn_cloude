@@ -142,6 +142,7 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			joinRoutes.Get("/members/{mid}/status", memberHandler.MemberStatus)
 			joinRoutes.Put("/members/{mid}/heartbeat", memberHandler.MemberHeartbeat)
 			joinRoutes.Get("/members/{mid}/peers", memberHandler.MemberPeers)
+			joinRoutes.Post("/members/{mid}/announce", memberHandler.MemberAnnounce)
 		})
 
 		// Auth endpoints

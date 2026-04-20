@@ -333,6 +333,42 @@ func (h *MemberHandler) MemberHeartbeat(w http.ResponseWriter, r *http.Request) 
 	writeSuccess(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
+// MemberAnnounce updates device endpoints using member-token auth.
+// POST /api/v1/members/{mid}/announce
+func (h *MemberHandler) MemberAnnounce(w http.ResponseWriter, r *http.Request) {
+	memberID := chi.URLParam(r, "mid")
+	token := readBearerToken(r)
+	peer, err := h.authenticateMember(r.Context(), memberID, token)
+	if err != nil {
+		h.writeMemberAuthError(w, err)
+		return
+	}
+	if peer.Status != "approved" {
+		writeError(w, http.StatusConflict, "member is not approved")
+		return
+	}
+
+	var req memberHeartbeatRequest // Uses the same endpoint structure
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.peers.UpdatePeerStatus(r.Context(), peer.ID, queries.PeerStatusUpdate{
+		PublicEndpoint: strings.TrimSpace(req.PublicEndpoint),
+		LocalEndpoints: req.LocalEndpoints,
+	}); err != nil {
+		if errors.Is(err, queries.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "member not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update member endpoints")
+		return
+	}
+
+	writeSuccess(w, http.StatusOK, map[string]string{"status": "announced"})
+}
+
 // MemberPeers returns online approved peers for the same network.
 // GET /api/v1/members/{mid}/peers
 func (h *MemberHandler) MemberPeers(w http.ResponseWriter, r *http.Request) {
