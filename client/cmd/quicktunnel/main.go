@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,6 +21,7 @@ import (
 	"quicktunnel/client/internal/api_client"
 	"quicktunnel/client/internal/config"
 	"quicktunnel/client/internal/vnc"
+	pkgcrypto "quicktunnel.local/pkg/crypto"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -36,6 +42,8 @@ func main() {
 	switch command {
 	case "join":
 		err = runJoin(args)
+	case "leave":
+		err = runDown(args)
 	case "up":
 		err = runUp(args)
 	case "down":
@@ -64,71 +72,198 @@ func main() {
 	}
 }
 
-// runJoin joins a network in one step — no config file required beforehand.
-// Usage: quicktunnel join --server <url> --network <id> --api-key <key>
-//        quicktunnel join --server <url> --network <id> --email <e> --password <p>
+// normalizeServerURL turns a bare IP or IP:port into a proper http:// URL.
+// Examples:
+//   54.89.232.16         → http://54.89.232.16:3000
+//   54.89.232.16:8080    → http://54.89.232.16:8080
+//   http://example.com   → http://example.com  (unchanged)
+func normalizeServerURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return strings.TrimRight(raw, "/")
+	}
+	// bare IP or IP:port
+	if !strings.Contains(raw, ":") {
+		raw = raw + ":3000"
+	}
+	return "http://" + raw
+}
+
+// ─── ZeroTier-style join ─────────────────────────────────────────────────────
+//
+// Usage:
+//   quicktunnel join <server>  <network_id>
+//   quicktunnel join 54.89.232.16 5agrlxob7exh
+//   quicktunnel join http://54.89.232.16:3000 5agrlxob7exh
+//
+// No API key, no flags needed.
+// Generates WireGuard keys, calls POST /api/v1/join, polls for approval,
+// then starts the tunnel automatically.
 func runJoin(args []string) error {
-	fs := flag.NewFlagSet("join", flag.ContinueOnError)
-	server   := fs.String("server",   "", "QuickTunnel server URL  (e.g. http://54.89.232.16:3000)")
-	network  := fs.String("network",  "", "Network ID to join       (shown in dashboard)")
-	apiKey   := fs.String("api-key",  "", "API key from dashboard   (Client setup details)")
-	email    := fs.String("email",    "", "Account email            (alternative to --api-key)")
-	password := fs.String("password", "", "Account password         (alternative to --api-key)")
-	name     := fs.String("name",     "", "Device name              (optional, defaults to hostname)")
-	noStart  := fs.Bool("no-start",   false, "Save config only, do not start the agent")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("join: parse flags: %w", err)
+	if len(args) < 2 {
+		return fmt.Errorf(
+			"Usage: quicktunnel join <server> <network_id>\n" +
+			"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh\n\n" +
+			"  server     — EC2 IP or URL (port 3000 is default)\n" +
+			"  network_id — from the dashboard")
 	}
 
-	if strings.TrimSpace(*server) == "" {
-		return fmt.Errorf("join: --server is required (e.g. http://54.89.232.16:3000)")
-	}
-	if strings.TrimSpace(*network) == "" {
-		return fmt.Errorf("join: --network is required (copy it from the dashboard)")
+	serverURL := normalizeServerURL(args[0])
+	networkID := strings.TrimSpace(args[1])
+
+	if networkID == "" {
+		return fmt.Errorf("join: network_id cannot be empty")
 	}
 
+	fmt.Printf("Server  : %s\n", serverURL)
+	fmt.Printf("Network : %s\n", networkID)
+
+	// Generate WireGuard key pair
+	fmt.Print("Generating WireGuard keys... ")
+	privKey, pubKey, err := pkgcrypto.GenerateKeyPair()
+	if err != nil {
+		return fmt.Errorf("join: generate keys: %w", err)
+	}
+	fmt.Println("done")
+
+	// Device name
+	deviceName, _ := os.Hostname()
+	if deviceName == "" {
+		deviceName = "unknown-device"
+	}
+
+	// POST /api/v1/join  — NO auth required
+	type joinReq struct {
+		NetworkID   string `json:"network_id"`
+		Hostname    string `json:"hostname"`
+		WGPublicKey string `json:"wg_public_key"`
+		OS          string `json:"os"`
+		Arch        string `json:"arch"`
+	}
+	type joinResp struct {
+		MemberID    string `json:"member_id"`
+		MemberToken string `json:"member_token"`
+		Status      string `json:"status"`
+		VirtualIP   string `json:"virtual_ip"`
+		NetworkCIDR string `json:"network_cidr"`
+		NetworkName string `json:"network_name"`
+		Message     string `json:"message"`
+	}
+	type envelope struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+		Error   string          `json:"error"`
+	}
+
+	doJoinRequest := func() (*joinResp, error) {
+		body, _ := json.Marshal(joinReq{
+			NetworkID:   networkID,
+			Hostname:    deviceName,
+			WGPublicKey: pubKey,
+			OS:          runtime.GOOS,
+			Arch:        runtime.GOARCH,
+		})
+		resp, err := http.Post(serverURL+"/api/v1/join", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("join: connect to server: %w", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+
+		var env envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return nil, fmt.Errorf("join: parse response: %w", err)
+		}
+		if !env.Success {
+			return nil, fmt.Errorf("join: server error: %s", env.Error)
+		}
+		var jr joinResp
+		if err := json.Unmarshal(env.Data, &jr); err != nil {
+			return nil, fmt.Errorf("join: parse join data: %w", err)
+		}
+		return &jr, nil
+	}
+
+	fmt.Print("Requesting to join... ")
+	jr, err := doJoinRequest()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("status=%s\n", jr.Status)
+
+	// If pending — poll until approved or rejected
+	if jr.Status == "pending" {
+		fmt.Printf("⏳ Waiting for admin to approve in dashboard (network: %s)...\n", jr.NetworkName)
+		fmt.Println("   Press Ctrl+C to cancel.")
+
+		type statusEnvelope struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Status    string `json:"status"`
+				VirtualIP string `json:"virtual_ip"`
+			} `json:"data"`
+		}
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		for {
+			time.Sleep(5 * time.Second)
+			req, _ := http.NewRequest("GET",
+				fmt.Sprintf("%s/api/v1/members/%s/status", serverURL, jr.MemberID), nil)
+			req.Header.Set("Authorization", "Bearer "+jr.MemberToken)
+			r, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("   (poll error: %v, retrying...)\n", err)
+				continue
+			}
+			raw, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+
+			var se statusEnvelope
+			if json.Unmarshal(raw, &se) == nil && se.Success {
+				switch se.Data.Status {
+				case "approved":
+					jr.Status = "approved"
+					jr.VirtualIP = se.Data.VirtualIP
+					fmt.Println("✓ Approved!")
+					goto approved
+				case "rejected":
+					return fmt.Errorf("join: your device was rejected by the network admin")
+				}
+			}
+			fmt.Print(".")
+		}
+	}
+
+approved:
+	if jr.Status != "approved" {
+		return fmt.Errorf("join: unexpected status: %s", jr.Status)
+	}
+
+	fmt.Printf("✓ Virtual IP : %s\n", jr.VirtualIP)
+	fmt.Printf("✓ Network    : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
+
+	// Save config
 	cfg := &config.Config{
-		ServerURL:    strings.TrimSpace(*server),
-		NetworkID:    strings.TrimSpace(*network),
+		ServerURL:    serverURL,
+		NetworkID:    networkID,
+		DeviceName:   deviceName,
 		LogLevel:     "info",
 		WGListenPort: 51820,
 		STUNServer:   "stun.l.google.com:19302",
+		MemberID:     jr.MemberID,
+		MemberToken:  jr.MemberToken,
+		WGPrivateKey: privKey,
 	}
-	if strings.TrimSpace(*name) != "" {
-		cfg.DeviceName = strings.TrimSpace(*name)
-	}
-
-	// Resolve API key — either directly supplied or obtained via login.
-	switch {
-	case strings.TrimSpace(*apiKey) != "":
-		cfg.APIKey = strings.TrimSpace(*apiKey)
-
-	case strings.TrimSpace(*email) != "" && strings.TrimSpace(*password) != "":
-		client := api_client.NewClient(cfg.ServerURL, "")
-		resp, err := client.Login(*email, *password)
-		if err != nil {
-			return fmt.Errorf("join: login failed: %w", err)
-		}
-		cfg.APIKey = resp.APIKey
-		cfg.Email = strings.TrimSpace(*email)
-		cfg.Password = strings.TrimSpace(*password)
-		fmt.Printf("Logged in as %s\n", resp.User.Email)
-
-	default:
-		return fmt.Errorf("join: supply either --api-key OR both --email and --password")
-	}
-
 	if err := config.Save(cfg); err != nil {
 		return fmt.Errorf("join: save config: %w", err)
 	}
-	fmt.Printf("Config saved  ->  server=%s  network=%s\n", cfg.ServerURL, cfg.NetworkID)
+	fmt.Println("✓ Config saved to ~/.quicktunnel/config.json")
+	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)")
 
-	if *noStart {
-		fmt.Println("Skipping agent start (--no-start). Run 'quicktunnel up' when ready.")
-		return nil
-	}
+	return startAgent(cfg)
+}
 
-	fmt.Println("Starting agent... (Ctrl+C to stop)")
+func startAgent(cfg *config.Config) error {
 	configureLogging(cfg.LogLevel)
 
 	ag := agent.NewAgent(cfg)
@@ -137,7 +272,7 @@ func runJoin(args []string) error {
 	})
 
 	if err := ag.Start(); err != nil {
-		return fmt.Errorf("join: start agent: %w", err)
+		return fmt.Errorf("start agent: %w", err)
 	}
 	defer ag.Stop()
 
@@ -153,272 +288,194 @@ func runJoin(args []string) error {
 	<-sigCh
 	log.Info().Msg("shutdown signal received")
 	if err := ag.Stop(); err != nil {
-		return fmt.Errorf("join: stop agent: %w", err)
+		return fmt.Errorf("stop agent: %w", err)
 	}
 	return nil
 }
 
 func runUp(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("up command does not accept arguments")
+		return fmt.Errorf("up: does not accept arguments")
 	}
-
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("up: load config: %w", err)
+		return fmt.Errorf("up: load config: %w\n\nRun: quicktunnel join <server> <network_id>", err)
 	}
-	configureLogging(cfg.LogLevel)
-
-	ag := agent.NewAgent(cfg)
-	ag.OnStateChange(func(from agent.AgentState, to agent.AgentState) {
-		log.Info().Str("from", string(from)).Str("to", string(to)).Msg("agent state changed")
-	})
-
-	if err := ag.Start(); err != nil {
-		return fmt.Errorf("up: start agent: %w", err)
-	}
-	defer ag.Stop()
-
-	if err := writePIDFile(os.Getpid()); err != nil {
-		log.Warn().Err(err).Msg("failed to write pid file")
-	}
-	defer removePIDFile()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	log.Info().Msg("quicktunnel agent running in foreground")
-	<-sigCh
-	log.Info().Msg("shutdown signal received")
-
-	if err := ag.Stop(); err != nil {
-		return fmt.Errorf("up: stop agent: %w", err)
-	}
-	return nil
+	return startAgent(cfg)
 }
 
 func runDown(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("down command does not accept arguments")
-	}
-
 	pid, err := readPIDFile()
 	if err != nil {
 		return fmt.Errorf("down: %w", err)
 	}
-
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return fmt.Errorf("down: find process: %w", err)
 	}
-
 	if err := process.Signal(syscall.SIGTERM); err != nil {
-		if killErr := process.Kill(); killErr != nil {
-			return fmt.Errorf("down: stop process: %w", err)
-		}
+		_ = process.Kill()
 	}
-
 	removePIDFile()
-	fmt.Printf("Sent stop signal to quicktunnel process %d\n", pid)
+	fmt.Printf("Disconnected (pid %d)\n", pid)
 	return nil
 }
 
 func runStatus(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("status command does not accept arguments")
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("status: load config: %w", err)
 	}
-
 	pid, pidErr := readPIDFile()
-	running := pidErr == nil
-
 	out := map[string]any{
-		"running":    running,
-		"pid":        pid,
-		"server_url": cfg.ServerURL,
-		"network_id": cfg.NetworkID,
+		"connected":   pidErr == nil,
+		"pid":         pid,
+		"server_url":  cfg.ServerURL,
+		"network_id":  cfg.NetworkID,
 		"device_name": cfg.DeviceName,
 	}
-
 	if cfg.APIKey != "" && cfg.NetworkID != "" {
 		client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
-		peers, err := client.GetPeers(cfg.NetworkID)
-		if err == nil {
+		if peers, err := client.GetPeers(cfg.NetworkID); err == nil {
 			out["peer_count"] = len(peers)
 		}
 	}
-
 	return printJSON(out)
 }
 
 func runPeers(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("peers command does not accept arguments")
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("peers: load config: %w", err)
 	}
 	if cfg.APIKey == "" || cfg.NetworkID == "" {
-		return fmt.Errorf("peers: api_key and network_id are required")
+		return fmt.Errorf("peers: api_key and network_id required")
 	}
-
 	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
 	peers, err := client.GetPeers(cfg.NetworkID)
 	if err != nil {
-		return fmt.Errorf("peers: fetch peers: %w", err)
+		return fmt.Errorf("peers: %w", err)
 	}
-
 	return printJSON(peers)
 }
 
 func runVNC(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("vnc usage: quicktunnel vnc <peer-name>")
+		return fmt.Errorf("usage: quicktunnel vnc <peer-name>")
 	}
-	peerName := strings.TrimSpace(args[0])
-	if peerName == "" {
-		return fmt.Errorf("vnc: peer-name is required")
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("vnc: load config: %w", err)
 	}
-	if cfg.APIKey == "" || cfg.NetworkID == "" {
-		return fmt.Errorf("vnc: api_key and network_id are required")
-	}
-
 	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
 	peers, err := client.GetPeers(cfg.NetworkID)
 	if err != nil {
 		return fmt.Errorf("vnc: fetch peers: %w", err)
 	}
-
-	for _, peerInfo := range peers {
-		if strings.EqualFold(strings.TrimSpace(peerInfo.Name), peerName) {
-			port := peerInfo.VNCPort
+	for _, p := range peers {
+		if strings.EqualFold(p.Name, args[0]) {
+			port := p.VNCPort
 			if port == 0 {
 				port = 5900
 			}
-			if err := vnc.LaunchVNCViewer(peerInfo.VirtualIP, port); err != nil {
+			if err := vnc.LaunchVNCViewer(p.VirtualIP, port); err != nil {
 				return fmt.Errorf("vnc: launch viewer: %w", err)
 			}
-			fmt.Printf("Launched VNC viewer for %s (%s:%d)\n", peerInfo.Name, peerInfo.VirtualIP, port)
+			fmt.Printf("VNC → %s (%s:%d)\n", p.Name, p.VirtualIP, port)
 			return nil
 		}
 	}
-
-	return fmt.Errorf("vnc: peer not found: %s", peerName)
+	return fmt.Errorf("vnc: peer not found: %s", args[0])
 }
 
 func runLogin(args []string) error {
-	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	email := fs.String("email", "", "user email")
-	password := fs.String("password", "", "user password")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("login: parse flags: %w", err)
+	var email, password string
+	for i := 0; i+1 < len(args); i++ {
+		switch args[i] {
+		case "--email":
+			email = args[i+1]
+		case "--password":
+			password = args[i+1]
+		}
 	}
-
-	if strings.TrimSpace(*email) == "" || strings.TrimSpace(*password) == "" {
-		return fmt.Errorf("login: --email and --password are required")
+	if email == "" || password == "" {
+		return fmt.Errorf("login: --email and --password required")
 	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("login: load config: %w", err)
 	}
-
-	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
-	resp, err := client.Login(*email, *password)
+	client := api_client.NewClient(cfg.ServerURL, "")
+	resp, err := client.Login(email, password)
 	if err != nil {
-		return fmt.Errorf("login: authenticate: %w", err)
+		return fmt.Errorf("login: %w", err)
 	}
-
 	cfg.APIKey = resp.APIKey
-	cfg.Email = strings.TrimSpace(*email)
-	cfg.Password = strings.TrimSpace(*password)
+	cfg.Email = email
 	if err := config.Save(cfg); err != nil {
 		return fmt.Errorf("login: save config: %w", err)
 	}
-
-	fmt.Printf("Login successful. API key saved for %s\n", resp.User.Email)
+	fmt.Printf("Logged in as %s\n", resp.User.Email)
 	return nil
 }
 
 func runConfig(args []string) error {
-	fs := flag.NewFlagSet("config", flag.ContinueOnError)
-	setValues := multiValueFlag{}
-	fs.Var(&setValues, "set", "set config value (key=value), repeatable")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("config: parse flags: %w", err)
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("config: load config: %w", err)
+		return fmt.Errorf("config: load: %w", err)
 	}
-
-	if len(setValues) == 0 {
-		return printJSON(cfg)
-	}
-
-	for _, item := range setValues {
+	for _, item := range args {
+		if strings.HasPrefix(item, "--set=") || strings.HasPrefix(item, "--set ") {
+			item = strings.TrimPrefix(item, "--set=")
+			item = strings.TrimPrefix(item, "--set ")
+		}
 		parts := strings.SplitN(item, "=", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("config: invalid --set value: %s", item)
+			continue
 		}
-		if err := applyConfigValue(cfg, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])); err != nil {
-			return fmt.Errorf("config: %w", err)
+		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		switch strings.ToLower(k) {
+		case "server_url":
+			cfg.ServerURL = v
+		case "api_key":
+			cfg.APIKey = v
+		case "network_id":
+			cfg.NetworkID = v
+		case "device_name":
+			cfg.DeviceName = v
+		case "log_level":
+			cfg.LogLevel = v
+		case "wg_listen_port":
+			if n, err := strconv.Atoi(v); err == nil {
+				cfg.WGListenPort = n
+			}
 		}
 	}
-
 	if err := config.Save(cfg); err != nil {
-		return fmt.Errorf("config: save file: %w", err)
+		return fmt.Errorf("config: save: %w", err)
 	}
 	return printJSON(cfg)
 }
 
-func applyConfigValue(cfg *config.Config, key, value string) error {
-	switch strings.ToLower(key) {
-	case "server_url":
-		cfg.ServerURL = value
-	case "api_key":
-		cfg.APIKey = value
-	case "network_id":
-		cfg.NetworkID = value
-	case "device_name":
-		cfg.DeviceName = value
-	case "vnc_port":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid vnc_port: %w", err)
-		}
-		cfg.VNCPort = v
-	case "log_level":
-		cfg.LogLevel = value
-	case "wg_listen_port":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid wg_listen_port: %w", err)
-		}
-		cfg.WGListenPort = v
-	case "stun_server":
-		cfg.STUNServer = value
-	case "email":
-		cfg.Email = value
-	case "password":
-		cfg.Password = value
-	default:
-		return fmt.Errorf("unknown config key: %s", key)
-	}
-	return nil
+func printUsage() {
+	fmt.Println("QuickTunnel — ZeroTier-style VPN")
+	fmt.Println("")
+	fmt.Println("CONNECT (no binary needed — runs the one-liner first):")
+	fmt.Println("  curl http://<server>/join/<network_id> | sudo bash")
+	fmt.Println("")
+	fmt.Println("OR if already installed:")
+	fmt.Println("  quicktunnel join <server>  <network_id>")
+	fmt.Println("  quicktunnel join 54.89.232.16 5agrlxob7exh")
+	fmt.Println("")
+	fmt.Println("COMMANDS:")
+	fmt.Println("  join   <server> <network_id>  — connect to a network")
+	fmt.Println("  leave  / down                 — disconnect")
+	fmt.Println("  status                        — show connection info")
+	fmt.Println("  peers                         — list network peers")
+	fmt.Println("  up                            — reconnect (uses saved config)")
+	fmt.Println("")
+	fmt.Println("  server   = EC2 IP (port 3000 is default) or full URL")
+	fmt.Println("  network  = ID from the dashboard")
 }
 
 func configureLogging(levelRaw string) {
@@ -430,58 +487,19 @@ func configureLogging(levelRaw string) {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 }
 
-func printUsage() {
-	fmt.Println("QuickTunnel CLI")
-	fmt.Println("")
-	fmt.Println("Usage:")
-	fmt.Println("  quicktunnel join --server <url> --network <id> --api-key <key>")
-	fmt.Println("  quicktunnel join --server <url> --network <id> --email <email> --password <pass>")
-	fmt.Println("")
-	fmt.Println("  quicktunnel up")
-	fmt.Println("  quicktunnel down")
-	fmt.Println("  quicktunnel status")
-	fmt.Println("  quicktunnel peers")
-	fmt.Println("  quicktunnel vnc <peer-name>")
-	fmt.Println("  quicktunnel login --email <email> --password <password>")
-	fmt.Println("  quicktunnel config [--set key=value]")
-	fmt.Println("")
-	fmt.Println("Join flags:")
-	fmt.Println("  --server    Server URL, e.g. http://54.89.232.16:3000")
-	fmt.Println("  --network   Network ID from the dashboard")
-	fmt.Println("  --api-key   API key from Client setup details on the dashboard")
-	fmt.Println("  --email     Account email (auto-fetches API key)")
-	fmt.Println("  --password  Account password (used with --email)")
-	fmt.Println("  --name      Optional device name")
-	fmt.Println("  --no-start  Save config only; do not start the agent")
-}
-
-func printJSON(value any) error {
-	payload, err := json.MarshalIndent(value, "", "  ")
+func printJSON(v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return fmt.Errorf("print json: marshal value: %w", err)
+		return err
 	}
-	fmt.Println(string(payload))
-	return nil
-}
-
-type multiValueFlag []string
-
-func (m *multiValueFlag) String() string {
-	if m == nil {
-		return ""
-	}
-	return strings.Join(*m, ",")
-}
-
-func (m *multiValueFlag) Set(value string) error {
-	*m = append(*m, value)
+	fmt.Println(string(b))
 	return nil
 }
 
 func pidFilePath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("pid path: resolve home dir: %w", err)
+		return "", err
 	}
 	return filepath.Join(home, ".quicktunnel", "quicktunnel.pid"), nil
 }
@@ -489,42 +507,32 @@ func pidFilePath() (string, error) {
 func writePIDFile(pid int) error {
 	path, err := pidFilePath()
 	if err != nil {
-		return fmt.Errorf("write pid file: %w", err)
+		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("write pid file: create directory: %w", err)
-	}
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0o644); err != nil {
-		return fmt.Errorf("write pid file: %w", err)
-	}
-	return nil
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0o644)
 }
 
 func readPIDFile() (int, error) {
 	path, err := pidFilePath()
 	if err != nil {
-		return 0, fmt.Errorf("read pid file: %w", err)
+		return 0, err
 	}
-	content, err := os.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, fmt.Errorf("read pid file: %w", err)
+		return 0, err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(content)))
-	if err != nil {
-		return 0, fmt.Errorf("read pid file: parse pid: %w", err)
-	}
-	return pid, nil
+	return strconv.Atoi(strings.TrimSpace(string(b)))
 }
 
 func removePIDFile() {
-	path, err := pidFilePath()
-	if err != nil {
-		return
+	if path, err := pidFilePath(); err == nil {
+		_ = os.Remove(path)
 	}
-	_ = os.Remove(path)
 }
 
 func init() {
-	// Keep timestamps deterministic in short-lived commands.
 	time.Local = time.UTC
+
+
 }
