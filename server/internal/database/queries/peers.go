@@ -43,6 +43,13 @@ func (s *PeerStore) RegisterPeer(ctx context.Context, peer *models.Peer) (*model
 	if peer == nil {
 		return nil, fmt.Errorf("register peer: peer is nil")
 	}
+	if strings.TrimSpace(peer.MemberToken) == "" {
+		token, err := generateMemberToken()
+		if err != nil {
+			return nil, fmt.Errorf("register peer: generate token: %w", err)
+		}
+		peer.MemberToken = token
+	}
 
 	query := `
 INSERT INTO peers (
