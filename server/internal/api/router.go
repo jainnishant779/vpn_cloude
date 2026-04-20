@@ -59,19 +59,19 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 		})
 	})
 
-	userStore  := queries.NewUserStore(db)
+	userStore := queries.NewUserStore(db)
 	networkStore := queries.NewNetworkStore(db)
-	peerStore  := queries.NewPeerStore(db)
+	peerStore := queries.NewPeerStore(db)
 	relayStore := queries.NewRelayStore(db)
 
-	authHandler     := NewAuthHandler(userStore, authService)
-	networkHandler  := NewNetworkHandler(networkStore, peerStore)
-	peerHandler     := NewPeerHandler(networkStore, peerStore)
-	coordHandler    := NewCoordHandler(redisClient, peerStore, relayStore)
-	joinHandler     := NewJoinHandler(networkStore, peerStore)
-	memberHandler   := NewMemberHandler(networkStore, peerStore)
-	cfg, _          := config.Load()
-	relayAssignHandler  := RelayAssignHandler(cfg)
+	authHandler := NewAuthHandler(userStore, authService)
+	networkHandler := NewNetworkHandler(networkStore, peerStore)
+	peerHandler := NewPeerHandler(networkStore, peerStore)
+	coordHandler := NewCoordHandler(redisClient, peerStore, relayStore)
+	joinHandler := NewJoinHandler(networkStore, peerStore)
+	memberHandler := NewMemberHandler(networkStore, peerStore)
+	cfg, _ := config.Load()
+	relayAssignHandler := RelayAssignHandler(cfg)
 	quickConnectHandler := NewQuickConnectHandler(quickConnect)
 	clientDownloadHandler := NewClientDownloadHandler()
 
@@ -140,6 +140,8 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			joinRoutes.Use(rl.auth.Limit(middleware.RemoteIPKey))
 			joinRoutes.Post("/join", joinHandler.Join)
 			joinRoutes.Get("/members/{mid}/status", memberHandler.MemberStatus)
+			joinRoutes.Put("/members/{mid}/heartbeat", memberHandler.MemberHeartbeat)
+			joinRoutes.Get("/members/{mid}/peers", memberHandler.MemberPeers)
 		})
 
 		// Auth endpoints

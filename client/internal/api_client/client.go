@@ -30,6 +30,9 @@ type Client struct {
 	mu     sync.RWMutex
 	apiKey string
 	token  string
+
+	memberID    string
+	memberToken string
 }
 
 // HTTPError wraps non-successful API responses.
@@ -94,6 +97,16 @@ type PeerRegistrationResult struct {
 	PeerID      string `json:"peer_id"`
 }
 
+// MemberStatusResponse is returned by member status polling endpoints.
+type MemberStatusResponse struct {
+	Status      string `json:"status"`
+	MemberID    string `json:"member_id"`
+	NetworkID   string `json:"network_id"`
+	NetworkName string `json:"network_name"`
+	NetworkCIDR string `json:"network_cidr"`
+	VirtualIP   string `json:"virtual_ip"`
+}
+
 // PeerStatus carries heartbeat updates to the server.
 type PeerStatus struct {
 	PublicEndpoint string   `json:"public_endpoint"`
@@ -134,6 +147,7 @@ const (
 	authNone requestAuthMode = iota
 	authJWT
 	authAPIKey
+	authMemberToken
 )
 
 // NewClient creates a coordination API client with sane defaults.
@@ -161,6 +175,26 @@ func (c *Client) SetAPIKey(apiKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.apiKey = strings.TrimSpace(apiKey)
+}
+
+// SetMemberAuth configures per-device auth for ZeroTier-style join mode.
+func (c *Client) SetMemberAuth(memberID, memberToken string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.memberID = strings.TrimSpace(memberID)
+	c.memberToken = strings.TrimSpace(memberToken)
+}
+
+func (c *Client) hasAPIKey() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiKey != ""
+}
+
+func (c *Client) memberAuth() (memberID, memberToken string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.memberID, c.memberToken
 }
 
 // Login authenticates user credentials and stores resulting session credentials.
@@ -195,6 +229,17 @@ func (c *Client) RegisterPeer(networkID string, req PeerRegisterRequest) (*PeerR
 
 // Heartbeat updates peer liveness and transport counters.
 func (c *Client) Heartbeat(networkID, peerID string, status PeerStatus) error {
+	if !c.hasAPIKey() {
+		memberID, memberToken := c.memberAuth()
+		if memberID != "" && memberToken != "" {
+			path := fmt.Sprintf("/api/v1/members/%s/heartbeat", url.PathEscape(memberID))
+			if err := c.doJSON(context.Background(), http.MethodPut, path, status, authMemberToken, nil); err != nil {
+				return fmt.Errorf("heartbeat (member): %w", err)
+			}
+			return nil
+		}
+	}
+
 	path := fmt.Sprintf("/api/v1/networks/%s/peers/%s/heartbeat", url.PathEscape(networkID), url.PathEscape(peerID))
 	if err := c.doJSON(context.Background(), http.MethodPut, path, status, authAPIKey, nil); err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
@@ -204,6 +249,18 @@ func (c *Client) Heartbeat(networkID, peerID string, status PeerStatus) error {
 
 // GetPeers fetches currently online peers for a network from coordination endpoint.
 func (c *Client) GetPeers(networkID string) ([]PeerInfo, error) {
+	if !c.hasAPIKey() {
+		memberID, memberToken := c.memberAuth()
+		if memberID != "" && memberToken != "" {
+			path := fmt.Sprintf("/api/v1/members/%s/peers", url.PathEscape(memberID))
+			var out []PeerInfo
+			if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authMemberToken, &out); err != nil {
+				return nil, fmt.Errorf("get peers (member): %w", err)
+			}
+			return out, nil
+		}
+	}
+
 	path := fmt.Sprintf("/api/v1/coord/peers/%s", url.PathEscape(networkID))
 	var out []PeerInfo
 	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authAPIKey, &out); err != nil {
@@ -214,10 +271,33 @@ func (c *Client) GetPeers(networkID string) ([]PeerInfo, error) {
 
 // Announce posts latest public/local endpoint information for this peer.
 func (c *Client) Announce(endpoint AnnounceRequest) error {
+	if !c.hasAPIKey() {
+		memberID, memberToken := c.memberAuth()
+		if memberID != "" && memberToken != "" {
+			// Member-auth flow piggybacks endpoint updates in heartbeat.
+			return nil
+		}
+	}
+
 	if err := c.doJSON(context.Background(), http.MethodPost, "/api/v1/coord/announce", endpoint, authAPIKey, nil); err != nil {
 		return fmt.Errorf("announce: %w", err)
 	}
 	return nil
+}
+
+// GetMemberStatus fetches latest join approval and network bootstrap details.
+func (c *Client) GetMemberStatus(memberID string) (*MemberStatusResponse, error) {
+	memberID = strings.TrimSpace(memberID)
+	if memberID == "" {
+		return nil, fmt.Errorf("member status: member id is required")
+	}
+
+	path := fmt.Sprintf("/api/v1/members/%s/status", url.PathEscape(memberID))
+	var out MemberStatusResponse
+	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authMemberToken, &out); err != nil {
+		return nil, fmt.Errorf("member status: %w", err)
+	}
+	return &out, nil
 }
 
 // GetNearestRelay requests relay fallback assignment for a peer.
@@ -349,6 +429,7 @@ func (c *Client) applyAuth(req *http.Request, mode requestAuthMode) error {
 	c.mu.RLock()
 	token := c.token
 	apiKey := c.apiKey
+	memberToken := c.memberToken
 	c.mu.RUnlock()
 
 	switch mode {
@@ -366,6 +447,12 @@ func (c *Client) applyAuth(req *http.Request, mode requestAuthMode) error {
 		}
 		req.Header.Set("X-API-Key", apiKey)
 		req.Header.Set("Authorization", "ApiKey "+apiKey)
+		return nil
+	case authMemberToken:
+		if memberToken == "" {
+			return fmt.Errorf("missing member token")
+		}
+		req.Header.Set("Authorization", "Bearer "+memberToken)
 		return nil
 	default:
 		return fmt.Errorf("unknown auth mode")

@@ -92,9 +92,10 @@ func normalizeServerURL(raw string) string {
 // ZeroTier-style join
 //
 // Usage:
-//   quicktunnel join <server>  <network_id>
-//   quicktunnel join 54.89.232.16 5agrlxob7exh
-//   quicktunnel join http://54.89.232.16:3000 5agrlxob7exh
+//
+//	quicktunnel join <server>  <network_id>
+//	quicktunnel join 54.89.232.16 5agrlxob7exh
+//	quicktunnel join http://54.89.232.16:3000 5agrlxob7exh
 //
 // No API key, no flags needed.
 // Generates WireGuard keys, calls POST /api/v1/join, polls for approval,
@@ -199,8 +200,10 @@ func runJoin(args []string) error {
 		type statusEnvelope struct {
 			Success bool `json:"success"`
 			Data    struct {
-				Status    string `json:"status"`
-				VirtualIP string `json:"virtual_ip"`
+				Status      string `json:"status"`
+				VirtualIP   string `json:"virtual_ip"`
+				NetworkCIDR string `json:"network_cidr"`
+				NetworkName string `json:"network_name"`
 			} `json:"data"`
 		}
 
@@ -224,6 +227,12 @@ func runJoin(args []string) error {
 				case "approved":
 					jr.Status = "approved"
 					jr.VirtualIP = se.Data.VirtualIP
+					if strings.TrimSpace(se.Data.NetworkCIDR) != "" {
+						jr.NetworkCIDR = strings.TrimSpace(se.Data.NetworkCIDR)
+					}
+					if strings.TrimSpace(se.Data.NetworkName) != "" {
+						jr.NetworkName = strings.TrimSpace(se.Data.NetworkName)
+					}
 					fmt.Println("Approved!")
 					goto approved
 				case "rejected":
@@ -246,6 +255,8 @@ approved:
 	cfg := &config.Config{
 		ServerURL:    serverURL,
 		NetworkID:    networkID,
+		NetworkCIDR:  strings.TrimSpace(jr.NetworkCIDR),
+		VirtualIP:    strings.TrimSpace(jr.VirtualIP),
 		DeviceName:   deviceName,
 		LogLevel:     "info",
 		WGListenPort: 51820,
@@ -334,8 +345,11 @@ func runStatus(args []string) error {
 		"network_id":  cfg.NetworkID,
 		"device_name": cfg.DeviceName,
 	}
-	if cfg.APIKey != "" && cfg.NetworkID != "" {
+	if cfg.NetworkID != "" {
 		client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+		if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
+			client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+		}
 		if peers, err := client.GetPeers(cfg.NetworkID); err == nil {
 			out["peer_count"] = len(peers)
 		}
@@ -348,10 +362,13 @@ func runPeers(args []string) error {
 	if err != nil {
 		return fmt.Errorf("peers: load config: %w", err)
 	}
-	if cfg.APIKey == "" || cfg.NetworkID == "" {
-		return fmt.Errorf("peers: api_key and network_id required")
+	if cfg.NetworkID == "" {
+		return fmt.Errorf("peers: network_id required")
 	}
 	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+	if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
+		client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+	}
 	peers, err := client.GetPeers(cfg.NetworkID)
 	if err != nil {
 		return fmt.Errorf("peers: %w", err)
@@ -368,6 +385,9 @@ func runVNC(args []string) error {
 		return fmt.Errorf("vnc: load config: %w", err)
 	}
 	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+	if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
+		client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+	}
 	peers, err := client.GetPeers(cfg.NetworkID)
 	if err != nil {
 		return fmt.Errorf("vnc: fetch peers: %w", err)

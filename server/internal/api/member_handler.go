@@ -25,15 +25,26 @@ type memberPeerManager interface {
 	GetPeerByMemberToken(ctx context.Context, token string) (*models.Peer, error)
 	ListMembers(ctx context.Context, networkID string) ([]models.Peer, error)
 	ListNetworkPeers(ctx context.Context, networkID string) ([]models.Peer, error)
+	GetOnlinePeers(ctx context.Context, networkID string) ([]models.Peer, error)
 	ApprovePeer(ctx context.Context, peerID, virtualIP string) (*models.Peer, error)
 	RejectPeer(ctx context.Context, peerID string) error
 	DeletePeer(ctx context.Context, peerID string) error
+	UpdatePeerStatus(ctx context.Context, peerID string, status queries.PeerStatusUpdate) error
 }
 
 // MemberHandler serves member management endpoints for the dashboard.
 type MemberHandler struct {
 	networks memberNetworkReader
 	peers    memberPeerManager
+}
+
+type memberHeartbeatRequest struct {
+	PublicEndpoint string   `json:"public_endpoint"`
+	LocalEndpoints []string `json:"local_endpoints"`
+	VNCAvailable   bool     `json:"vnc_available"`
+	RXBytes        int64    `json:"rx_bytes"`
+	TXBytes        int64    `json:"tx_bytes"`
+	RelayID        string   `json:"relay_id"`
 }
 
 func NewMemberHandler(networks memberNetworkReader, peers memberPeerManager) *MemberHandler {
@@ -255,37 +266,150 @@ func (h *MemberHandler) KickMember(w http.ResponseWriter, r *http.Request) {
 // Auth: member_token in Authorization header.
 func (h *MemberHandler) MemberStatus(w http.ResponseWriter, r *http.Request) {
 	memberID := chi.URLParam(r, "mid")
-
-	// Authenticate via member_token
-	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	token = strings.TrimSpace(token)
-	if token == "" {
-		writeError(w, http.StatusUnauthorized, "member_token is required")
-		return
-	}
-
-	// Verify the token belongs to this member
-	peer, err := h.peers.GetPeerByMemberToken(r.Context(), token)
+	token := readBearerToken(r)
+	peer, err := h.authenticateMember(r.Context(), memberID, token)
 	if err != nil {
-		if errors.Is(err, queries.ErrNotFound) {
-			writeError(w, http.StatusUnauthorized, "invalid member token")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to verify token")
+		h.writeMemberAuthError(w, err)
 		return
 	}
-	if peer.ID != memberID {
-		writeError(w, http.StatusForbidden, "token does not match member")
+
+	network, err := h.networks.GetNetwork(r.Context(), peer.NetworkID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load network")
 		return
 	}
 
 	resp := map[string]string{
-		"status": peer.Status,
+		"status":       peer.Status,
+		"member_id":    peer.ID,
+		"network_id":   network.NetworkID,
+		"network_name": network.Name,
+		"network_cidr": network.CIDR,
 	}
 	if peer.Status == "approved" && peer.VirtualIP != "" && peer.VirtualIP != "0.0.0.0" {
 		resp["virtual_ip"] = peer.VirtualIP
 	}
 
 	writeSuccess(w, http.StatusOK, resp)
+}
+
+// MemberHeartbeat updates device heartbeat using member-token auth.
+// PUT /api/v1/members/{mid}/heartbeat
+func (h *MemberHandler) MemberHeartbeat(w http.ResponseWriter, r *http.Request) {
+	memberID := chi.URLParam(r, "mid")
+	token := readBearerToken(r)
+	peer, err := h.authenticateMember(r.Context(), memberID, token)
+	if err != nil {
+		h.writeMemberAuthError(w, err)
+		return
+	}
+	if peer.Status != "approved" {
+		writeError(w, http.StatusConflict, "member is not approved")
+		return
+	}
+
+	var req memberHeartbeatRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.peers.UpdatePeerStatus(r.Context(), peer.ID, queries.PeerStatusUpdate{
+		PublicEndpoint: strings.TrimSpace(req.PublicEndpoint),
+		LocalEndpoints: req.LocalEndpoints,
+		VNCAvailable:   req.VNCAvailable,
+		RXBytes:        req.RXBytes,
+		TXBytes:        req.TXBytes,
+		RelayID:        strings.TrimSpace(req.RelayID),
+	}); err != nil {
+		if errors.Is(err, queries.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "member not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update member status")
+		return
+	}
+
+	writeSuccess(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// MemberPeers returns online approved peers for the same network.
+// GET /api/v1/members/{mid}/peers
+func (h *MemberHandler) MemberPeers(w http.ResponseWriter, r *http.Request) {
+	memberID := chi.URLParam(r, "mid")
+	token := readBearerToken(r)
+	peer, err := h.authenticateMember(r.Context(), memberID, token)
+	if err != nil {
+		h.writeMemberAuthError(w, err)
+		return
+	}
+	if peer.Status != "approved" {
+		writeError(w, http.StatusConflict, "member is not approved")
+		return
+	}
+
+	peers, err := h.peers.GetOnlinePeers(r.Context(), peer.NetworkID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list peers")
+		return
+	}
+
+	filtered := make([]models.Peer, 0, len(peers))
+	for _, candidate := range peers {
+		if candidate.ID == peer.ID {
+			continue
+		}
+		if candidate.Status != "approved" {
+			continue
+		}
+		candidate.MemberToken = ""
+		filtered = append(filtered, candidate)
+	}
+
+	writeSuccess(w, http.StatusOK, filtered)
+}
+
+var (
+	errMissingMemberToken = errors.New("missing member token")
+	errInvalidMemberToken = errors.New("invalid member token")
+	errMemberMismatch     = errors.New("token does not match member")
+)
+
+func readBearerToken(r *http.Request) string {
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	return token
+}
+
+func (h *MemberHandler) authenticateMember(ctx context.Context, memberID, token string) (*models.Peer, error) {
+	memberID = strings.TrimSpace(memberID)
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errMissingMemberToken
+	}
+
+	peer, err := h.peers.GetPeerByMemberToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, queries.ErrNotFound) {
+			return nil, errInvalidMemberToken
+		}
+		return nil, err
+	}
+	if peer.ID != memberID {
+		return nil, errMemberMismatch
+	}
+	return peer, nil
+}
+
+func (h *MemberHandler) writeMemberAuthError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errMissingMemberToken):
+		writeError(w, http.StatusUnauthorized, "member_token is required")
+	case errors.Is(err, errInvalidMemberToken):
+		writeError(w, http.StatusUnauthorized, "invalid member token")
+	case errors.Is(err, errMemberMismatch):
+		writeError(w, http.StatusForbidden, "token does not match member")
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to verify token")
+	}
 }

@@ -14,6 +14,8 @@ type Config struct {
 	ServerURL    string `json:"server_url"`
 	APIKey       string `json:"api_key,omitempty"`
 	NetworkID    string `json:"network_id"`
+	NetworkCIDR  string `json:"network_cidr,omitempty"`
+	VirtualIP    string `json:"virtual_ip,omitempty"`
 	DeviceName   string `json:"device_name"`
 	VNCPort      int    `json:"vnc_port,omitempty"`
 	LogLevel     string `json:"log_level"`
@@ -82,14 +84,28 @@ func ConfigPath() (string, error) {
 }
 
 func applyEnvOverrides(cfg *Config) {
-	if v := env("SERVER_URL"); v != "" { cfg.ServerURL = v }
-	if v := env("API_KEY"); v != "" { cfg.APIKey = v }
-	if v := env("NETWORK_ID"); v != "" { cfg.NetworkID = v }
-	if v := env("DEVICE_NAME"); v != "" { cfg.DeviceName = v }
-	if v := env("LOG_LEVEL"); v != "" { cfg.LogLevel = v }
-	if v := env("STUN_SERVER"); v != "" { cfg.STUNServer = v }
+	if v := env("SERVER_URL"); v != "" {
+		cfg.ServerURL = v
+	}
+	if v := env("API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
+	if v := env("NETWORK_ID"); v != "" {
+		cfg.NetworkID = v
+	}
+	if v := env("DEVICE_NAME"); v != "" {
+		cfg.DeviceName = v
+	}
+	if v := env("LOG_LEVEL"); v != "" {
+		cfg.LogLevel = v
+	}
+	if v := env("STUN_SERVER"); v != "" {
+		cfg.STUNServer = v
+	}
 	if v := env("WG_LISTEN_PORT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil { cfg.WGListenPort = n }
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.WGListenPort = n
+		}
 	}
 }
 

@@ -10,23 +10,23 @@ import (
 	"sync"
 	"time"
 
+	pkgcrypto "quicktunnel.local/pkg/crypto"
+	"quicktunnel.local/pkg/netutil"
 	"quicktunnel/client/internal/api_client"
 	"quicktunnel/client/internal/config"
 	"quicktunnel/client/internal/nat"
 	"quicktunnel/client/internal/peer"
 	"quicktunnel/client/internal/tunnel"
 	"quicktunnel/client/internal/vnc"
-	pkgcrypto "quicktunnel.local/pkg/crypto"
-	"quicktunnel.local/pkg/netutil"
 
 	"github.com/rs/zerolog/log"
 )
 
 const (
-	heartbeatInterval     = 30 * time.Second
-	vncDiscoveryInterval  = 60 * time.Second
+	heartbeatInterval      = 30 * time.Second
+	vncDiscoveryInterval   = 60 * time.Second
 	qualityMonitorInterval = 90 * time.Second
-	maxReconnectBackoff   = 2 * time.Minute
+	maxReconnectBackoff    = 2 * time.Minute
 )
 
 // Agent orchestrates tunnel, peer connectivity, and local VNC status.
@@ -80,10 +80,17 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("agent start: network_id is required")
 	}
 
+	memberMode := strings.TrimSpace(a.config.APIKey) == "" &&
+		strings.TrimSpace(a.config.MemberID) != "" &&
+		strings.TrimSpace(a.config.MemberToken) != ""
+
 	a.state.Set(StateAuthenticating)
 	a.apiClient = api_client.NewClient(a.config.ServerURL, a.config.APIKey)
+	if memberMode {
+		a.apiClient.SetMemberAuth(a.config.MemberID, a.config.MemberToken)
+	}
 
-	if strings.TrimSpace(a.config.APIKey) == "" {
+	if !memberMode && strings.TrimSpace(a.config.APIKey) == "" {
 		if strings.TrimSpace(a.config.Email) == "" || strings.TrimSpace(a.config.Password) == "" {
 			return fmt.Errorf("agent start: api_key or (email/password) is required")
 		}
@@ -94,35 +101,82 @@ func (a *Agent) Start() error {
 		a.config.APIKey = loginResp.APIKey
 	}
 
-	a.state.Set(StateRegistering)
-	privateKey, publicKey, err := pkgcrypto.GenerateKeyPair()
-	if err != nil {
-		return fmt.Errorf("agent start: generate key pair: %w", err)
-	}
+	var (
+		privateKey  string
+		peerID      string
+		virtualIP   string
+		networkCIDR string
+		err         error
+	)
 
-	deviceName := strings.TrimSpace(a.config.DeviceName)
-	if deviceName == "" {
-		deviceName = "quicktunnel-device"
-	}
+	if memberMode {
+		privateKey = strings.TrimSpace(a.config.WGPrivateKey)
+		if privateKey == "" {
+			return fmt.Errorf("agent start: wg_private_key is required for member-token mode; run join again")
+		}
 
-	registerResp, err := a.apiClient.RegisterPeer(a.config.NetworkID, api_client.PeerRegisterRequest{
-		MachineID: pkgcrypto.MachineFingerprint(),
-		PublicKey: publicKey,
-		Name:      deviceName,
-		OS:        runtimeOS(),
-		Version:   "0.1.0",
-		VNCPort:   maxInt(a.config.VNCPort, 5900),
-	})
-	if err != nil {
-		return fmt.Errorf("agent start: register peer: %w", err)
+		memberStatus, statusErr := a.apiClient.GetMemberStatus(a.config.MemberID)
+		if statusErr != nil {
+			return fmt.Errorf("agent start: member status: %w", statusErr)
+		}
+		if strings.TrimSpace(memberStatus.Status) != "approved" {
+			return fmt.Errorf("agent start: member is %s; approval is required", strings.TrimSpace(memberStatus.Status))
+		}
+
+		if strings.TrimSpace(memberStatus.NetworkID) != "" {
+			a.config.NetworkID = strings.TrimSpace(memberStatus.NetworkID)
+		}
+		if strings.TrimSpace(memberStatus.VirtualIP) != "" {
+			a.config.VirtualIP = strings.TrimSpace(memberStatus.VirtualIP)
+		}
+		if strings.TrimSpace(memberStatus.NetworkCIDR) != "" {
+			a.config.NetworkCIDR = strings.TrimSpace(memberStatus.NetworkCIDR)
+		}
+		if strings.TrimSpace(memberStatus.MemberID) != "" {
+			a.config.MemberID = strings.TrimSpace(memberStatus.MemberID)
+		}
+
+		virtualIP = strings.TrimSpace(a.config.VirtualIP)
+		networkCIDR = strings.TrimSpace(a.config.NetworkCIDR)
+		peerID = strings.TrimSpace(a.config.MemberID)
+		if virtualIP == "" || networkCIDR == "" || peerID == "" {
+			return fmt.Errorf("agent start: incomplete member bootstrap data")
+		}
+	} else {
+		a.state.Set(StateRegistering)
+		var publicKey string
+		privateKey, publicKey, err = pkgcrypto.GenerateKeyPair()
+		if err != nil {
+			return fmt.Errorf("agent start: generate key pair: %w", err)
+		}
+
+		deviceName := strings.TrimSpace(a.config.DeviceName)
+		if deviceName == "" {
+			deviceName = "quicktunnel-device"
+		}
+
+		registerResp, registerErr := a.apiClient.RegisterPeer(a.config.NetworkID, api_client.PeerRegisterRequest{
+			MachineID: pkgcrypto.MachineFingerprint(),
+			PublicKey: publicKey,
+			Name:      deviceName,
+			OS:        runtimeOS(),
+			Version:   "0.1.0",
+			VNCPort:   maxInt(a.config.VNCPort, 5900),
+		})
+		if registerErr != nil {
+			return fmt.Errorf("agent start: register peer: %w", registerErr)
+		}
+		virtualIP = strings.TrimSpace(registerResp.VirtualIP)
+		networkCIDR = strings.TrimSpace(registerResp.NetworkCIDR)
+		peerID = strings.TrimSpace(registerResp.PeerID)
 	}
 
 	a.mu.Lock()
-	a.virtualIP = registerResp.VirtualIP
-	a.peerID = registerResp.PeerID
+	a.virtualIP = virtualIP
+	a.peerID = peerID
 	a.mu.Unlock()
 
-	a.tunnel, err = tunnel.NewWGTunnel(privateKey, registerResp.VirtualIP, registerResp.NetworkCIDR, maxInt(a.config.WGListenPort, 51820))
+	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, maxInt(a.config.WGListenPort, 51820))
 	if err != nil {
 		return fmt.Errorf("agent start: create tunnel: %w", err)
 	}
@@ -147,7 +201,7 @@ func (a *Agent) Start() error {
 	a.mu.Unlock()
 
 	if err := a.apiClient.Announce(api_client.AnnounceRequest{
-		PeerID:         registerResp.PeerID,
+		PeerID:         peerID,
 		NetworkID:      a.config.NetworkID,
 		PublicEndpoint: endpoint,
 		LocalEndpoints: netutil.GetLocalIPs(),
@@ -169,7 +223,7 @@ func (a *Agent) Start() error {
 	}
 
 	a.state.Set(StateConnecting)
-	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, registerResp.PeerID)
+	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, peerID)
 	a.peerMgr.Start()
 
 	a.wg.Add(3)
@@ -188,8 +242,8 @@ func (a *Agent) Start() error {
 
 	a.state.Set(StateRunning)
 	log.Info().
-		Str("peer_id", registerResp.PeerID).
-		Str("virtual_ip", registerResp.VirtualIP).
+		Str("peer_id", peerID).
+		Str("virtual_ip", virtualIP).
 		Int("vnc_port", a.vncPort).
 		Msg("QuickTunnel running. VNC accessible through tunnel")
 	return nil
@@ -378,13 +432,13 @@ func (a *Agent) Status() map[string]any {
 	}
 
 	return map[string]any{
-		"state":          a.state.Get(),
-		"peer_id":        a.peerID,
-		"virtual_ip":     a.virtualIP,
+		"state":           a.state.Get(),
+		"peer_id":         a.peerID,
+		"virtual_ip":      a.virtualIP,
 		"public_endpoint": a.publicEndpoint,
-		"vnc_port":       a.vncPort,
-		"vnc_available":  a.vncAvailable,
-		"connections":    connections,
+		"vnc_port":        a.vncPort,
+		"vnc_available":   a.vncAvailable,
+		"connections":     connections,
 	}
 }
 
