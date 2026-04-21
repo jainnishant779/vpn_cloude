@@ -1,19 +1,10 @@
 package api
 
-// member_tunnel_handler.go
-//
-// Member-token-authenticated tunnel endpoints for ZeroTier-style peers.
-// Called by quicktunnel client after join, using member_token (no API key needed).
-//
-// Routes (added in router.go):
-//   PUT  /api/v1/members/{mid}/heartbeat
-//   GET  /api/v1/members/{mid}/peers
-//   POST /api/v1/members/{mid}/announce
-
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -31,7 +22,6 @@ type memberTunnelPeerStore interface {
 	GetOnlinePeers(ctx context.Context, networkID string) ([]models.Peer, error)
 }
 
-// MemberTunnelHandler serves member-token-authenticated tunnel endpoints.
 type MemberTunnelHandler struct {
 	peers memberTunnelPeerStore
 	redis *redis.Client
@@ -41,7 +31,16 @@ func NewMemberTunnelHandler(peers memberTunnelPeerStore, redisClient *redis.Clie
 	return &MemberTunnelHandler{peers: peers, redis: redisClient}
 }
 
-// authMember validates the Bearer member_token and returns the peer.
+// decodeJSONBodyLoose decodes JSON without rejecting unknown fields.
+// Used for member endpoints where the client may send extra fields.
+func decodeJSONBodyLoose(r *http.Request, dest any) error {
+	if r.Body == nil {
+		return fmt.Errorf("request body is required")
+	}
+	defer r.Body.Close()
+	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(dest)
+}
+
 func (h *MemberTunnelHandler) authMember(w http.ResponseWriter, r *http.Request) *models.Peer {
 	memberID := strings.TrimSpace(chi.URLParam(r, "mid"))
 	token := strings.TrimSpace(strings.TrimPrefix(
@@ -75,7 +74,7 @@ func (h *MemberTunnelHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 		RXBytes        int64    `json:"rx_bytes"`
 		TXBytes        int64    `json:"tx_bytes"`
 	}
-	if err := decodeJSONBody(r, &req); err != nil {
+	if err := decodeJSONBodyLoose(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -94,7 +93,6 @@ func (h *MemberTunnelHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 }
 
 // Peers — GET /api/v1/members/{mid}/peers
-// Returns all other online+approved peers in same network.
 func (h *MemberTunnelHandler) Peers(w http.ResponseWriter, r *http.Request) {
 	peer := h.authMember(w, r)
 	if peer == nil {
@@ -109,16 +107,15 @@ func (h *MemberTunnelHandler) Peers(w http.ResponseWriter, r *http.Request) {
 	result := make([]models.Peer, 0, len(peers))
 	for _, p := range peers {
 		if p.ID == peer.ID {
-			continue // exclude self
+			continue
 		}
-		p.MemberToken = "" // never expose other peers' tokens
+		p.MemberToken = ""
 		result = append(result, p)
 	}
 	writeSuccess(w, http.StatusOK, result)
 }
 
 // Announce — POST /api/v1/members/{mid}/announce
-// Publishes WireGuard endpoint to Redis (same format as CoordHandler).
 func (h *MemberTunnelHandler) Announce(w http.ResponseWriter, r *http.Request) {
 	peer := h.authMember(w, r)
 	if peer == nil {
@@ -128,8 +125,11 @@ func (h *MemberTunnelHandler) Announce(w http.ResponseWriter, r *http.Request) {
 		PublicEndpoint string   `json:"public_endpoint"`
 		LocalEndpoints []string `json:"local_endpoints"`
 	}
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	// Use loose decoder — ignore unknown fields from client
+	if err := decodeJSONBodyLoose(r, &req); err != nil {
+		// Even if decode fails, don't hard-fail — just skip Redis update
+		log.Warn().Err(err).Str("peer_id", peer.ID).Msg("announce: decode failed, skipping")
+		writeSuccess(w, http.StatusOK, map[string]string{"status": "skipped"})
 		return
 	}
 	if h.redis != nil && strings.TrimSpace(req.PublicEndpoint) != "" {
@@ -155,7 +155,7 @@ func (h *MemberTunnelHandler) Announce(w http.ResponseWriter, r *http.Request) {
 		pipe.SAdd(r.Context(), indexKey, peer.ID)
 		pipe.Expire(r.Context(), indexKey, 70*time.Second)
 		if _, err := pipe.Exec(r.Context()); err != nil {
-			log.Warn().Err(err).Str("peer_id", peer.ID).Msg("member announce redis failed")
+			log.Warn().Err(err).Str("peer_id", peer.ID).Msg("announce: redis write failed")
 		}
 	}
 	writeSuccess(w, http.StatusOK, map[string]string{"status": "announced"})

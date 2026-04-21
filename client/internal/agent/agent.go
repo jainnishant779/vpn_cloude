@@ -208,7 +208,7 @@ func (a *Agent) Start() error {
 			PublicEndpoint: endpoint,
 			LocalEndpoints: netutil.GetLocalIPs(),
 		}); err != nil {
-			return fmt.Errorf("agent start: announce endpoint: %w", err)
+			log.Warn().Err(err).Msg("announce failed (non-fatal, tunnel will still start)")
 		}
 	}
 
