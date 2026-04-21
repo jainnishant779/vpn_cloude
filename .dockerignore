@@ -8,8 +8,12 @@ go*.linux-*.tar.gz
 __pycache__
 *.pyc
 .env.example
-docs/
-binaries/
+
+.git
+node_modules
+*.zip
+*.tar
+*.tar.gz
+*.log
 client/bin/
-node_modules/
 web/node_modules/
