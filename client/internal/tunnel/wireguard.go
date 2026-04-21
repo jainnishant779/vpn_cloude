@@ -3,6 +3,7 @@ package tunnel
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -223,4 +224,45 @@ func validateWireGuardKey(privateKey string) error {
 		return fmt.Errorf("validate key: expected 32-byte key material")
 	}
 	return nil
+
+// ReadPacket reads a raw IP packet from the TUN device.
+func (w *WGTunnel) ReadPacket(buf []byte) (int, error) {
+	w.mu.RLock()
+	dev := w.device
+	w.mu.RUnlock()
+	if dev == nil {
+		return 0, fmt.Errorf("read packet: tunnel not started")
+	}
+	return dev.Read(buf)
+}
+
+// WritePacket writes a raw IP packet into the TUN device.
+func (w *WGTunnel) WritePacket(buf []byte) (int, error) {
+	w.mu.RLock()
+	dev := w.device
+	w.mu.RUnlock()
+	if dev == nil {
+		return 0, fmt.Errorf("write packet: tunnel not started")
+	}
+	return dev.Write(buf)
+}
+
+// FindEndpointByVirtualIP returns the UDP endpoint for a peer whose AllowedIP
+// contains the given destination IP.
+func (w *WGTunnel) FindEndpointByVirtualIP(destIP string) (string, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	parsed := net.ParseIP(destIP)
+	if parsed == nil {
+		return "", false
+	}
+	for _, p := range w.peers {
+		_, network, err := net.ParseCIDR(p.AllowedIP)
+		if err == nil && network.Contains(parsed) {
+			return p.Endpoint, true
+		}
+	}
+	return "", false
+}
+
 }

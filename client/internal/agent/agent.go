@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"runtime"
@@ -230,6 +231,7 @@ func (a *Agent) Start() error {
 	a.state.Set(StateConnecting)
 	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, peerID)
 	a.peerMgr.Start()
+	a.startPacketForwarding()
 
 	a.wg.Add(3)
 	go func() { defer a.wg.Done(); a.heartbeatLoop(useMemberToken) }()
@@ -480,4 +482,130 @@ func isLocalPortOpen(port int) bool {
 	}
 	_ = conn.Close()
 	return true
+
+// ─── Packet Forwarding ────────────────────────────────────────────────────────
+//
+// packetForwardLoop is the DATA PLANE that was missing.
+// It runs two goroutines:
+//   • outbound: TUN → read raw IP packet → send to peer's UDP endpoint
+//   • inbound:  UDP socket → receive packet → write to TUN
+//
+// Packet wire format (to distinguish from hole-punch probes):
+//   [4 bytes magic "QTDT"] [raw IPv4 packet ...]
+//
+var qtDataMagic = []byte{0x51, 0x54, 0x44, 0x54} // "QTDT"
+
+func (a *Agent) startPacketForwarding() {
+	conn := a.holePuncher.Conn()
+	if conn == nil {
+		log.Warn().Msg("packet forward: no UDP conn available, skipping")
+		return
+	}
+
+	// outbound: TUN → UDP
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 1<<16)
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, err := a.tunnel.ReadPacket(buf)
+			if err != nil {
+				continue
+			}
+			if n < 20 {
+				continue // too short to be a valid IPv4 packet
+			}
+
+			// IPv4 destination is bytes 16–19
+			_ = buf[19]
+			destIP := net.IP(buf[16:20]).String()
+
+			endpoint, ok := a.tunnel.FindEndpointByVirtualIP(destIP)
+			if !ok {
+				continue
+			}
+
+			peerAddr, err := net.ResolveUDPAddr("udp", endpoint)
+			if err != nil {
+				log.Debug().Err(err).Str("dest", destIP).Msg("forward: resolve endpoint")
+				continue
+			}
+
+			// Prepend magic header
+			pkt := make([]byte, 4+n)
+			copy(pkt, qtDataMagic)
+			copy(pkt[4:], buf[:n])
+
+			if _, err := conn.WriteToUDP(pkt, peerAddr); err != nil {
+				log.Debug().Err(err).Str("dest", destIP).Msg("forward: send UDP")
+			}
+		}
+	}()
+
+	// inbound: UDP → TUN
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 1<<16)
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+
+			// Must start with our data magic; ignore punch probes and noise
+			if n < 4+20 || !isMagic(buf[:4], qtDataMagic) {
+				continue
+			}
+
+			ipPkt := buf[4:n]
+			if _, err := a.tunnel.WritePacket(ipPkt); err != nil {
+				log.Debug().Err(err).Msg("forward: write to TUN")
+			}
+		}
+	}()
+}
+
+func isMagic(got, want []byte) bool {
+	if len(got) < len(want) {
+		return false
+	}
+	for i, b := range want {
+		if got[i] != b {
+			return false
+		}
+	}
+	return true
+}
+
+// destIPFromPacket extracts destination IP string from a raw IPv4 packet.
+// Exported for testing; not used outside this file.
+func destIPFromPacket(pkt []byte) string {
+	if len(pkt) < 20 {
+		return ""
+	}
+	// IP version check
+	if (pkt[0]>>4) != 4 {
+		return ""
+	}
+	return net.IP(pkt[16:20]).String()
+}
+
+// silences "imported and not used: encoding/binary" if unused elsewhere
+var _ = binary.BigEndian
+
 }
