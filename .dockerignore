@@ -12,3 +12,4 @@ docs/
 binaries/
 client/bin/
 node_modules/
+web/node_modules/
