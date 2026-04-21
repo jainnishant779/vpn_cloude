@@ -3,11 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -16,11 +16,11 @@ import (
 	"syscall"
 	"time"
 
-	pkgcrypto "quicktunnel.local/pkg/crypto"
 	"quicktunnel/client/internal/agent"
 	"quicktunnel/client/internal/api_client"
 	"quicktunnel/client/internal/config"
 	"quicktunnel/client/internal/vnc"
+	pkgcrypto "quicktunnel.local/pkg/crypto"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -41,12 +41,10 @@ func main() {
 	switch command {
 	case "join":
 		err = runJoin(args)
-	case "leave":
+	case "leave", "down":
 		err = runDown(args)
 	case "up":
 		err = runUp(args)
-	case "down":
-		err = runDown(args)
 	case "status":
 		err = runStatus(args)
 	case "peers":
@@ -66,58 +64,62 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// normalizeServerURL turns a bare IP or IP:port into a proper http:// URL.
-// Examples:
-//
-//	54.89.232.16         -> http://54.89.232.16:3000
-//	54.89.232.16:8080    -> http://54.89.232.16:8080
-//	http://example.com   -> http://example.com  (unchanged)
+// normalizeServerURL: bare IP → http://IP:3000
 func normalizeServerURL(raw string) string {
 	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		return strings.TrimRight(raw, "/")
 	}
-	// bare IP or IP:port
 	if !strings.Contains(raw, ":") {
 		raw = raw + ":3000"
 	}
 	return "http://" + raw
 }
 
-// ZeroTier-style join
+// ─────────────────────────────────────────────────────────────────────────────
+// JOIN  — ZeroTier-style
 //
-// Usage:
+//   quicktunnel join <server> <network_id>
+//   quicktunnel join 54.89.232.16 5agrlxob7exh
 //
-//	quicktunnel join <server>  <network_id>
-//	quicktunnel join 54.89.232.16 5agrlxob7exh
-//	quicktunnel join http://54.89.232.16:3000 5agrlxob7exh
-//
-// No API key, no flags needed.
-// Generates WireGuard keys, calls POST /api/v1/join, polls for approval,
-// then starts the tunnel automatically.
+// No API key. Generates WireGuard keys, POST /api/v1/join,
+// polls for approval if pending, then starts tunnel.
+// ─────────────────────────────────────────────────────────────────────────────
 func runJoin(args []string) error {
-	if len(args) < 2 {
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	nameFlag := fs.String("name", "", "Device name (optional)")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("join: %w", err)
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
 		return fmt.Errorf(
 			"Usage: quicktunnel join <server> <network_id>\n" +
-				"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh\n\n" +
-				"  server     - EC2 IP or URL (port 3000 is default)\n" +
-				"  network_id - from the dashboard")
+			"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh")
 	}
 
-	serverURL := normalizeServerURL(args[0])
-	networkID := strings.TrimSpace(args[1])
-
-	if networkID == "" {
-		return fmt.Errorf("join: network_id cannot be empty")
-	}
+	serverURL := normalizeServerURL(rest[0])
+	networkID := strings.TrimSpace(rest[1])
 
 	fmt.Printf("Server  : %s\n", serverURL)
 	fmt.Printf("Network : %s\n", networkID)
+
+	// Device name
+	deviceName := strings.TrimSpace(*nameFlag)
+	if deviceName == "" {
+		deviceName, _ = os.Hostname()
+	}
+	if deviceName == "" {
+		deviceName = "unknown-device"
+	}
 
 	// Generate WireGuard key pair
 	fmt.Print("Generating WireGuard keys... ")
@@ -127,13 +129,7 @@ func runJoin(args []string) error {
 	}
 	fmt.Println("done")
 
-	// Device name
-	deviceName, _ := os.Hostname()
-	if deviceName == "" {
-		deviceName = "unknown-device"
-	}
-
-	// POST /api/v1/join - no auth required.
+	// POST /api/v1/join  (no auth required)
 	type joinReq struct {
 		NetworkID   string `json:"network_id"`
 		Hostname    string `json:"hostname"`
@@ -156,7 +152,7 @@ func runJoin(args []string) error {
 		Error   string          `json:"error"`
 	}
 
-	doJoinRequest := func() (*joinResp, error) {
+	doPost := func() (*joinResp, error) {
 		body, _ := json.Marshal(joinReq{
 			NetworkID:   networkID,
 			Hostname:    deviceName,
@@ -166,110 +162,111 @@ func runJoin(args []string) error {
 		})
 		resp, err := http.Post(serverURL+"/api/v1/join", "application/json", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("join: connect to server: %w", err)
+			return nil, fmt.Errorf("cannot reach server: %w", err)
 		}
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(resp.Body)
-
 		var env envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
-			return nil, fmt.Errorf("join: parse response: %w", err)
+			return nil, fmt.Errorf("parse response: %w", err)
 		}
 		if !env.Success {
-			return nil, fmt.Errorf("join: server error: %s", env.Error)
+			return nil, fmt.Errorf("server: %s", env.Error)
 		}
 		var jr joinResp
 		if err := json.Unmarshal(env.Data, &jr); err != nil {
-			return nil, fmt.Errorf("join: parse join data: %w", err)
+			return nil, fmt.Errorf("parse join data: %w", err)
 		}
 		return &jr, nil
 	}
 
-	fmt.Print("Requesting to join... ")
-	jr, err := doJoinRequest()
+	fmt.Print("Sending join request... ")
+	jr, err := doPost()
 	if err != nil {
-		return err
+		return fmt.Errorf("join: %w", err)
 	}
 	fmt.Printf("status=%s\n", jr.Status)
 
-	// If pending, poll until approved or rejected.
+	// ── Poll for approval if pending ──────────────────────────────────────────
 	if jr.Status == "pending" {
-		fmt.Printf("Waiting for admin to approve in dashboard (network: %s)...\n", jr.NetworkName)
-		fmt.Println("   Press Ctrl+C to cancel.")
+		fmt.Printf("\n⏳ Waiting for admin to approve in dashboard (network: %s)\n", jr.NetworkName)
+		fmt.Println("   Dashboard → Networks → Members → Approve")
+		fmt.Println("   Press Ctrl+C to cancel.\n")
 
-		type statusEnvelope struct {
+		type statusEnv struct {
 			Success bool `json:"success"`
 			Data    struct {
-				Status      string `json:"status"`
-				VirtualIP   string `json:"virtual_ip"`
-				NetworkCIDR string `json:"network_cidr"`
-				NetworkName string `json:"network_name"`
+				Status    string `json:"status"`
+				VirtualIP string `json:"virtual_ip"`
 			} `json:"data"`
 		}
 
 		client := &http.Client{Timeout: 10 * time.Second}
+		dots := 0
 		for {
-			time.Sleep(5 * time.Second)
+			time.Sleep(4 * time.Second)
 			req, _ := http.NewRequest("GET",
 				fmt.Sprintf("%s/api/v1/members/%s/status", serverURL, jr.MemberID), nil)
 			req.Header.Set("Authorization", "Bearer "+jr.MemberToken)
 			r, err := client.Do(req)
 			if err != nil {
-				fmt.Printf("   (poll error: %v, retrying...)\n", err)
+				fmt.Print("?")
 				continue
 			}
 			raw, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			var se statusEnvelope
+			var se statusEnv
 			if json.Unmarshal(raw, &se) == nil && se.Success {
 				switch se.Data.Status {
 				case "approved":
-					jr.Status = "approved"
+					jr.Status    = "approved"
 					jr.VirtualIP = se.Data.VirtualIP
-					if strings.TrimSpace(se.Data.NetworkCIDR) != "" {
-						jr.NetworkCIDR = strings.TrimSpace(se.Data.NetworkCIDR)
-					}
-					if strings.TrimSpace(se.Data.NetworkName) != "" {
-						jr.NetworkName = strings.TrimSpace(se.Data.NetworkName)
-					}
-					fmt.Println("Approved!")
+					fmt.Println("\n✓ Approved!")
 					goto approved
 				case "rejected":
+					fmt.Println()
 					return fmt.Errorf("join: your device was rejected by the network admin")
 				}
 			}
-			fmt.Print(".")
+			dots++
+			if dots%15 == 0 {
+				fmt.Printf(" (still waiting...)\n  ")
+			} else {
+				fmt.Print(".")
+			}
 		}
 	}
 
 approved:
 	if jr.Status != "approved" {
-		return fmt.Errorf("join: unexpected status: %s", jr.Status)
+		return fmt.Errorf("join: unexpected status: %s — %s", jr.Status, jr.Message)
 	}
 
-	fmt.Printf("Virtual IP : %s\n", jr.VirtualIP)
-	fmt.Printf("Network    : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
+	fmt.Printf("\n✓ Virtual IP  : %s\n", jr.VirtualIP)
+	fmt.Printf("✓ Network     : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
+	fmt.Printf("✓ Member ID   : %s\n", jr.MemberID)
 
-	// Save config
+	// Save config — everything the agent needs, no API key
 	cfg := &config.Config{
 		ServerURL:    serverURL,
 		NetworkID:    networkID,
-		NetworkCIDR:  strings.TrimSpace(jr.NetworkCIDR),
-		VirtualIP:    strings.TrimSpace(jr.VirtualIP),
 		DeviceName:   deviceName,
 		LogLevel:     "info",
 		WGListenPort: 51820,
 		STUNServer:   "stun.l.google.com:19302",
+		// ZeroTier-style fields
 		MemberID:     jr.MemberID,
 		MemberToken:  jr.MemberToken,
 		WGPrivateKey: privKey,
+		VirtualIP:    jr.VirtualIP,
+		NetworkCIDR:  jr.NetworkCIDR,
 	}
 	if err := config.Save(cfg); err != nil {
 		return fmt.Errorf("join: save config: %w", err)
 	}
-	fmt.Println("Config saved to ~/.quicktunnel/config.json")
-	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)")
+	fmt.Println("✓ Config saved  ~/.quicktunnel/config.json")
+	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)\n")
 
 	return startAgent(cfg)
 }
@@ -279,7 +276,13 @@ func startAgent(cfg *config.Config) error {
 
 	ag := agent.NewAgent(cfg)
 	ag.OnStateChange(func(from agent.AgentState, to agent.AgentState) {
-		log.Info().Str("from", string(from)).Str("to", string(to)).Msg("agent state changed")
+		switch to {
+		case agent.StateRunning:
+			fmt.Printf("✓ Tunnel UP  —  virtual IP: %s\n", cfg.VirtualIP)
+		case agent.StateReconnecting:
+			fmt.Println("⚠ Reconnecting...")
+		}
+		log.Info().Str("from", string(from)).Str("to", string(to)).Msg("state")
 	})
 
 	if err := ag.Start(); err != nil {
@@ -297,28 +300,24 @@ func startAgent(cfg *config.Config) error {
 	defer signal.Stop(sigCh)
 
 	<-sigCh
-	log.Info().Msg("shutdown signal received")
-	if err := ag.Stop(); err != nil {
-		return fmt.Errorf("stop agent: %w", err)
-	}
+	fmt.Println("\nDisconnecting...")
+	_ = ag.Stop()
 	return nil
 }
 
 func runUp(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("up: does not accept arguments")
-	}
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("up: load config: %w\n\nRun: quicktunnel join <server> <network_id>", err)
 	}
+	fmt.Printf("Reconnecting to %s / %s\n", cfg.ServerURL, cfg.NetworkID)
 	return startAgent(cfg)
 }
 
 func runDown(args []string) error {
 	pid, err := readPIDFile()
 	if err != nil {
-		return fmt.Errorf("down: %w", err)
+		return fmt.Errorf("not connected (no pid file)")
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
@@ -335,23 +334,33 @@ func runDown(args []string) error {
 func runStatus(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("status: load config: %w", err)
+		return fmt.Errorf("status: %w", err)
 	}
 	pid, pidErr := readPIDFile()
 	out := map[string]any{
 		"connected":   pidErr == nil,
 		"pid":         pid,
-		"server_url":  cfg.ServerURL,
+		"server":      cfg.ServerURL,
 		"network_id":  cfg.NetworkID,
+		"virtual_ip":  cfg.VirtualIP,
 		"device_name": cfg.DeviceName,
+		"mode":        func() string {
+			if cfg.MemberToken != "" {
+				return "zerotier"
+			}
+			return "classic"
+		}(),
 	}
-	if cfg.NetworkID != "" {
-		client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
-		if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
-			client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+	if cfg.MemberToken != "" {
+		c := api_client.NewClient(cfg.ServerURL, "")
+		c.SetMemberToken(cfg.MemberToken)
+		if peers, err := c.MemberGetPeers(cfg.MemberID); err == nil {
+			out["peers_online"] = len(peers)
 		}
-		if peers, err := client.GetPeers(cfg.NetworkID); err == nil {
-			out["peer_count"] = len(peers)
+	} else if cfg.APIKey != "" {
+		c := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+		if peers, err := c.GetPeers(cfg.NetworkID); err == nil {
+			out["peers_online"] = len(peers)
 		}
 	}
 	return printJSON(out)
@@ -360,16 +369,22 @@ func runStatus(args []string) error {
 func runPeers(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("peers: load config: %w", err)
+		return fmt.Errorf("peers: %w", err)
 	}
-	if cfg.NetworkID == "" {
-		return fmt.Errorf("peers: network_id required")
+	if cfg.MemberToken != "" {
+		c := api_client.NewClient(cfg.ServerURL, "")
+		c.SetMemberToken(cfg.MemberToken)
+		peers, err := c.MemberGetPeers(cfg.MemberID)
+		if err != nil {
+			return fmt.Errorf("peers: %w", err)
+		}
+		return printJSON(peers)
 	}
-	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
-	if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
-		client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+	if cfg.APIKey == "" {
+		return fmt.Errorf("peers: not connected — run 'quicktunnel join <server> <network_id>'")
 	}
-	peers, err := client.GetPeers(cfg.NetworkID)
+	c := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+	peers, err := c.GetPeers(cfg.NetworkID)
 	if err != nil {
 		return fmt.Errorf("peers: %w", err)
 	}
@@ -382,15 +397,19 @@ func runVNC(args []string) error {
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("vnc: load config: %w", err)
+		return fmt.Errorf("vnc: %w", err)
 	}
-	client := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
-	if cfg.APIKey == "" && cfg.MemberID != "" && cfg.MemberToken != "" {
-		client.SetMemberAuth(cfg.MemberID, cfg.MemberToken)
+	var peers []api_client.PeerInfo
+	if cfg.MemberToken != "" {
+		c := api_client.NewClient(cfg.ServerURL, "")
+		c.SetMemberToken(cfg.MemberToken)
+		peers, err = c.MemberGetPeers(cfg.MemberID)
+	} else {
+		c := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
+		peers, err = c.GetPeers(cfg.NetworkID)
 	}
-	peers, err := client.GetPeers(cfg.NetworkID)
 	if err != nil {
-		return fmt.Errorf("vnc: fetch peers: %w", err)
+		return fmt.Errorf("vnc: %w", err)
 	}
 	for _, p := range peers {
 		if strings.EqualFold(p.Name, args[0]) {
@@ -399,9 +418,9 @@ func runVNC(args []string) error {
 				port = 5900
 			}
 			if err := vnc.LaunchVNCViewer(p.VirtualIP, port); err != nil {
-				return fmt.Errorf("vnc: launch viewer: %w", err)
+				return fmt.Errorf("vnc: launch: %w", err)
 			}
-			fmt.Printf("VNC -> %s (%s:%d)\n", p.Name, p.VirtualIP, port)
+			fmt.Printf("VNC → %s (%s:%d)\n", p.Name, p.VirtualIP, port)
 			return nil
 		}
 	}
@@ -409,32 +428,25 @@ func runVNC(args []string) error {
 }
 
 func runLogin(args []string) error {
-	var email, password string
-	for i := 0; i+1 < len(args); i++ {
-		switch args[i] {
-		case "--email":
-			email = args[i+1]
-		case "--password":
-			password = args[i+1]
-		}
-	}
-	if email == "" || password == "" {
+	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	email    := fs.String("email", "", "")
+	password := fs.String("password", "", "")
+	_ = fs.Parse(args)
+	if *email == "" || *password == "" {
 		return fmt.Errorf("login: --email and --password required")
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("login: load config: %w", err)
+		cfg = &config.Config{ServerURL: "http://localhost:8080"}
 	}
-	client := api_client.NewClient(cfg.ServerURL, "")
-	resp, err := client.Login(email, password)
+	c := api_client.NewClient(cfg.ServerURL, "")
+	resp, err := c.Login(*email, *password)
 	if err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
 	cfg.APIKey = resp.APIKey
-	cfg.Email = email
-	if err := config.Save(cfg); err != nil {
-		return fmt.Errorf("login: save config: %w", err)
-	}
+	cfg.Email  = *email
+	_ = config.Save(cfg)
 	fmt.Printf("Logged in as %s\n", resp.User.Email)
 	return nil
 }
@@ -442,67 +454,54 @@ func runLogin(args []string) error {
 func runConfig(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("config: load: %w", err)
+		return fmt.Errorf("config: %w", err)
 	}
-	for _, item := range args {
-		if strings.HasPrefix(item, "--set=") || strings.HasPrefix(item, "--set ") {
-			item = strings.TrimPrefix(item, "--set=")
-			item = strings.TrimPrefix(item, "--set ")
-		}
-		parts := strings.SplitN(item, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-		switch strings.ToLower(k) {
-		case "server_url":
-			cfg.ServerURL = v
-		case "api_key":
-			cfg.APIKey = v
-		case "network_id":
-			cfg.NetworkID = v
-		case "device_name":
-			cfg.DeviceName = v
-		case "log_level":
-			cfg.LogLevel = v
-		case "wg_listen_port":
-			if n, err := strconv.Atoi(v); err == nil {
-				cfg.WGListenPort = n
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+	setVal := fs.String("set", "", "key=value")
+	_ = fs.Parse(args)
+	if *setVal != "" {
+		parts := strings.SplitN(*setVal, "=", 2)
+		if len(parts) == 2 {
+			k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			switch k {
+			case "server_url": cfg.ServerURL = v
+			case "api_key":    cfg.APIKey = v
+			case "network_id": cfg.NetworkID = v
+			case "device_name": cfg.DeviceName = v
+			case "log_level":  cfg.LogLevel = v
+			case "wg_listen_port":
+				if n, err := strconv.Atoi(v); err == nil { cfg.WGListenPort = n }
 			}
 		}
-	}
-	if err := config.Save(cfg); err != nil {
-		return fmt.Errorf("config: save: %w", err)
+		_ = config.Save(cfg)
 	}
 	return printJSON(cfg)
 }
 
 func printUsage() {
-	fmt.Println("QuickTunnel - ZeroTier-style VPN")
-	fmt.Println("")
-	fmt.Println("CONNECT (no binary needed - runs the one-liner first):")
-	fmt.Println("  curl http://<server>/join/<network_id> | sudo bash")
-	fmt.Println("")
-	fmt.Println("OR if already installed:")
-	fmt.Println("  quicktunnel join <server>  <network_id>")
-	fmt.Println("  quicktunnel join 54.89.232.16 5agrlxob7exh")
-	fmt.Println("")
-	fmt.Println("COMMANDS:")
-	fmt.Println("  join   <server> <network_id>  - connect to a network")
-	fmt.Println("  leave  / down                 - disconnect")
-	fmt.Println("  status                        - show connection info")
-	fmt.Println("  peers                         - list network peers")
-	fmt.Println("  up                            - reconnect (uses saved config)")
-	fmt.Println("")
-	fmt.Println("  server   = EC2 IP (port 3000 is default) or full URL")
-	fmt.Println("  network  = ID from the dashboard")
+	fmt.Println(`QuickTunnel — ZeroTier-style mesh VPN
+
+CONNECT (no binary needed):
+  curl http://<server>/join/<network_id> | sudo bash
+
+CONNECT (if already installed):
+  quicktunnel join <server> <network_id>
+  quicktunnel join 54.89.232.16 5agrlxob7exh
+
+COMMANDS:
+  join   <server> <network_id>  connect (generates keys, polls for approval)
+  leave                         disconnect
+  up                            reconnect using saved config
+  status                        show connection info
+  peers                         list network peers
+  vnc    <peer-name>            open VNC to a peer
+
+  server     = EC2 IP (default port 3000) or full URL
+  network_id = from the dashboard`)
 }
 
 func configureLogging(levelRaw string) {
-	level, err := zerolog.ParseLevel(strings.ToLower(strings.TrimSpace(levelRaw)))
-	if err != nil {
-		level = zerolog.InfoLevel
-	}
+	level, _ := zerolog.ParseLevel(strings.ToLower(strings.TrimSpace(levelRaw)))
 	zerolog.SetGlobalLevel(level)
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 }
@@ -551,7 +550,4 @@ func removePIDFile() {
 	}
 }
 
-func init() {
-	time.Local = time.UTC
-
-}
+func init() { time.Local = time.UTC }

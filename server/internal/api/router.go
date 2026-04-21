@@ -59,27 +59,39 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 		})
 	})
 
-	userStore := queries.NewUserStore(db)
+	userStore    := queries.NewUserStore(db)
 	networkStore := queries.NewNetworkStore(db)
-	peerStore := queries.NewPeerStore(db)
-	relayStore := queries.NewRelayStore(db)
+	peerStore    := queries.NewPeerStore(db)
+	relayStore   := queries.NewRelayStore(db)
 
-	authHandler := NewAuthHandler(userStore, authService)
-	networkHandler := NewNetworkHandler(networkStore, peerStore)
-	peerHandler := NewPeerHandler(networkStore, peerStore)
-	coordHandler := NewCoordHandler(redisClient, peerStore, relayStore)
-	joinHandler := NewJoinHandler(networkStore, peerStore)
-	memberHandler := NewMemberHandler(networkStore, peerStore)
-	cfg, _ := config.Load()
-	relayAssignHandler := RelayAssignHandler(cfg)
-	quickConnectHandler := NewQuickConnectHandler(quickConnect)
+	authHandler          := NewAuthHandler(userStore, authService)
+	networkHandler       := NewNetworkHandler(networkStore, peerStore)
+	peerHandler          := NewPeerHandler(networkStore, peerStore)
+	coordHandler         := NewCoordHandler(redisClient, peerStore, relayStore)
+	joinHandler          := NewJoinHandler(networkStore, peerStore)
+	memberHandler        := NewMemberHandler(networkStore, peerStore)
+	memberTunnelHandler  := NewMemberTunnelHandler(peerStore, redisClient)
+	cfg, _               := config.Load()
+	relayAssignHandler   := RelayAssignHandler(cfg)
+	quickConnectHandler  := NewQuickConnectHandler(quickConnect)
 	clientDownloadHandler := NewClientDownloadHandler()
+	installHandler       := NewInstallScriptHandler(GetServerURL())
 
-	// ── ZeroTier-style join + install scripts ───────────────────────────────
-	installHandler := NewInstallScriptHandler(GetServerURL())
+	apiKeyAuth := auth.NewAPIKeyAuth(func(ctx context.Context, apiKey string) (string, error) {
+		user, err := userStore.GetUserByAPIKey(ctx, apiKey)
+		if err != nil {
+			if errors.Is(err, queries.ErrNotFound) {
+				return "", err
+			}
+			return "", err
+		}
+		return user.ID, nil
+	})
+
+	// ── Install / ZeroTier-style join scripts ────────────────────────────────
+	// curl http://<server>/join/<network_id> | sudo bash
 	r.Get("/install.sh", installHandler.ServeScript)
 	r.Head("/install.sh", installHandler.ServeScript)
-	// ONE-LINER: curl http://<server>/join/<network_id> | sudo bash
 	r.Get("/join/{network_id}", installHandler.ServeJoin)
 
 	// ── Health ───────────────────────────────────────────────────────────────
@@ -117,35 +129,29 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 		})
 	})
 
-	// ── API v1 ───────────────────────────────────────────────────────────────
-	apiKeyAuth := auth.NewAPIKeyAuth(func(ctx context.Context, apiKey string) (string, error) {
-		user, err := userStore.GetUserByAPIKey(ctx, apiKey)
-		if err != nil {
-			if errors.Is(err, queries.ErrNotFound) {
-				return "", err
-			}
-			return "", err
-		}
-		return user.ID, nil
-	})
-
 	r.Route("/api/v1", func(v1 chi.Router) {
 		if quickConnect != nil && quickConnect.Enabled {
 			v1.Get("/quick-connect", quickConnectHandler.Get)
 		}
 		v1.Get("/downloads/client/{os}/{arch}", clientDownloadHandler.Get)
 
-		// Unauthenticated: ZeroTier-style join + member status polling
+		// ── ZeroTier-style join (no auth) ─────────────────────────────────
 		v1.Group(func(joinRoutes chi.Router) {
 			joinRoutes.Use(rl.auth.Limit(middleware.RemoteIPKey))
 			joinRoutes.Post("/join", joinHandler.Join)
-			joinRoutes.Get("/members/{mid}/status", memberHandler.MemberStatus)
-			joinRoutes.Put("/members/{mid}/heartbeat", memberHandler.MemberHeartbeat)
-			joinRoutes.Get("/members/{mid}/peers", memberHandler.MemberPeers)
-			joinRoutes.Post("/members/{mid}/announce", memberHandler.MemberAnnounce)
 		})
 
-		// Auth endpoints
+		// ── Member-token tunnel endpoints (ZeroTier peers) ────────────────
+		// Auth: Bearer <member_token>  (no API key needed)
+		v1.Group(func(memberTunnel chi.Router) {
+			memberTunnel.Use(rl.agent.Limit(middleware.RemoteIPKey))
+			memberTunnel.Get("/members/{mid}/status", memberHandler.MemberStatus)
+			memberTunnel.Put("/members/{mid}/heartbeat", memberTunnelHandler.Heartbeat)
+			memberTunnel.Get("/members/{mid}/peers", memberTunnelHandler.Peers)
+			memberTunnel.Post("/members/{mid}/announce", memberTunnelHandler.Announce)
+		})
+
+		// ── Auth ──────────────────────────────────────────────────────────
 		v1.Group(func(authRoutes chi.Router) {
 			authRoutes.Use(rl.auth.Limit(middleware.RemoteIPKey))
 			authRoutes.Post("/auth/register", authHandler.Register)
@@ -153,7 +159,7 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			authRoutes.Post("/auth/refresh", authHandler.Refresh)
 		})
 
-		// Dashboard (JWT)
+		// ── Dashboard (JWT) ───────────────────────────────────────────────
 		v1.Group(func(userProtected chi.Router) {
 			userProtected.Use(authService.AuthMiddleware)
 			userProtected.Route("/networks", func(networks chi.Router) {
@@ -170,7 +176,7 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			})
 		})
 
-		// Agent (API key)
+		// ── Agent / API-key endpoints ─────────────────────────────────────
 		v1.Group(func(agentProtected chi.Router) {
 			agentProtected.Use(apiKeyAuth.APIKeyMiddleware)
 			agentProtected.Use(rl.agent.Limit(middleware.RemoteIPKey))
