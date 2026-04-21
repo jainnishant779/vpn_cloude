@@ -225,6 +225,8 @@ func validateWireGuardKey(privateKey string) error {
 	}
 	return nil
 
+}
+
 // ReadPacket reads a raw IP packet from the TUN device.
 func (w *WGTunnel) ReadPacket(buf []byte) (int, error) {
 	w.mu.RLock()
@@ -263,6 +265,4 @@ func (w *WGTunnel) FindEndpointByVirtualIP(destIP string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
 }
