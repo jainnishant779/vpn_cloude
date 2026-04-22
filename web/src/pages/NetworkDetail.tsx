@@ -6,7 +6,7 @@ import { useNetworkStore } from "../store/networkStore";
 
 export default function NetworkDetail() {
   const { id = "" } = useParams();
-  const { selectedNetwork, peers, loading, error, fetchNetworkDetail, fetchPeers } = useNetworkStore();
+  const { selectedNetwork, peers, loading, error, fetchNetworkDetail, fetchPeers, kickMember } = useNetworkStore();
 
   useEffect(() => {
     if (!id) return;
@@ -47,6 +47,9 @@ export default function NetworkDetail() {
           peers={peers}
           onConnectVNC={(peer) => {
             window.alert(`Use quicktunnel CLI: quicktunnel vnc ${peer.name || peer.machine_id}`);
+          }}
+          onRemove={(peer) => {
+            if (id) void kickMember(id, peer.id);
           }}
         />
       </section>

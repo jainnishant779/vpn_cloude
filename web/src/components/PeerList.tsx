@@ -4,9 +4,10 @@ import StatusBadge from "./StatusBadge";
 interface Props {
   peers: Peer[];
   onConnectVNC?: (peer: Peer) => void;
+  onRemove?: (peer: Peer) => void;
 }
 
-export default function PeerList({ peers, onConnectVNC }: Props) {
+export default function PeerList({ peers, onConnectVNC, onRemove }: Props) {
   return (
     <div className="overflow-x-auto rounded-xl2 border border-ink/10 bg-white/80">
       <table className="min-w-full text-sm">
@@ -18,7 +19,8 @@ export default function PeerList({ peers, onConnectVNC }: Props) {
             <th className="px-4 py-3">OS</th>
             <th className="px-4 py-3">VNC</th>
             <th className="px-4 py-3">Last Seen</th>
-            <th className="px-4 py-3" />
+            <th className="px-4 py-3">VNC</th>
+            <th className="px-4 py-3">Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -40,6 +42,15 @@ export default function PeerList({ peers, onConnectVNC }: Props) {
                   className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-zinc-300"
                 >
                   Connect VNC
+                </button>
+              </td>
+              <td className="px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => { if(window.confirm(\`Remove \${peer.name}?\`)) onRemove?.(peer); }}
+                  className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-600"
+                >
+                  Remove
                 </button>
               </td>
             </tr>

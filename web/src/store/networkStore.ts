@@ -12,6 +12,7 @@ interface NetworkState {
   createNetwork: (payload: { name: string; description: string }) => Promise<void>;
   fetchNetworkDetail: (networkId: string) => Promise<void>;
   fetchPeers: (networkId: string) => Promise<void>;
+  kickMember: (networkId: string, memberId: string) => Promise<void>;
 }
 
 export const useNetworkStore = create<NetworkState>((set) => ({
@@ -61,6 +62,17 @@ export const useNetworkStore = create<NetworkState>((set) => ({
       set({ peers, loading: false });
     } catch {
       set({ loading: false, error: "Failed to load peers." });
+    }
+  },
+
+  kickMember: async (networkId: string, memberId: string) => {
+    try {
+      await networkApi.kickMember(networkId, memberId);
+      set((state) => ({
+        peers: state.peers.filter((p) => p.id !== memberId)
+      }));
+    } catch {
+      set({ error: "Failed to remove member." });
     }
   }
 }));
