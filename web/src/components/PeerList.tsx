@@ -47,7 +47,7 @@ export default function PeerList({ peers, onConnectVNC, onRemove }: Props) {
               <td className="px-4 py-3">
                 <button
                   type="button"
-                  onClick={() => { if(window.confirm(\`Remove \${peer.name}?\`)) onRemove?.(peer); }}
+                  onClick={() => { if(window.confirm("Remove " + peer.name + "?")) onRemove?.(peer); }}
                   className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-600"
                 >
                   Remove
