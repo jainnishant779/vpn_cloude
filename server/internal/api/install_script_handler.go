@@ -9,6 +9,52 @@ import (
 )
 
 // InstallScriptHandler serves:
+	)
+
+	// ServeJoinPS1 handles GET /join/{network_id}/ps1
+	// This serves a PowerShell script for Windows one-liner install.
+	func (h *InstallScriptHandler) ServeJoinPS1(w http.ResponseWriter, r *http.Request) {
+		networkID := strings.TrimSpace(chi.URLParam(r, "network_id"))
+		if networkID == "" {
+			http.Error(w, "network_id is required", http.StatusBadRequest)
+			return
+		}
+		serverURL := h.deriveServerURL(r)
+		script := buildInstallPS1(serverURL, networkID)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", "inline; filename=install.ps1")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(script))
+	}
+
+	// buildInstallPS1 generates a PowerShell script for Windows quicktunnel install and join
+	func buildInstallPS1(serverURL, networkID string) string {
+		binaryURL := serverURL + "/api/v1/downloads/client/windows/amd64"
+		wintunURL := "https://www.wintun.net/builds/wintun-0.14.1.zip"
+		ps := `$ErrorActionPreference = 'Stop'
+	function Download($url, $dest) {
+	    Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+	}
+
+	$bin = "C:\\quicktunnel.exe"
+	$wintunZip = "C:\\wintun.zip"
+	$wintunDir = "C:\\wintun"
+	$wintunDLL = "C:\\wintun.dll"
+
+	Write-Host "[1/3] Downloading quicktunnel.exe..."
+	Download "` + binaryURL + `" $bin
+
+	Write-Host "[2/3] Downloading WinTun..."
+	Download "` + wintunURL + `" $wintunZip
+	Expand-Archive -Path $wintunZip -DestinationPath $wintunDir -Force
+	Copy-Item "$wintunDir\wintun\bin\amd64\wintun.dll" $wintunDLL -Force
+
+	Write-Host "[3/3] Joining network..."
+	& $bin join ` + strings.TrimPrefix(serverURL, "http://") + ` ` + networkID + `
+	`
+		return ps
+	}
 //   GET /install.sh            — generic installer
 //   GET /join/{network_id}     — ZeroTier-style one-liner
 //
