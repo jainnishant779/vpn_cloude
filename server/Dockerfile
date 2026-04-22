@@ -25,6 +25,7 @@ FROM alpine:3.20
 RUN adduser -D app
 WORKDIR /app
 COPY --from=builder /out/server /usr/local/bin/server
+COPY --from=builder /src/server/internal/database/migrations ./internal/database/migrations
 USER app
 EXPOSE 8080
 CMD ["server"]
