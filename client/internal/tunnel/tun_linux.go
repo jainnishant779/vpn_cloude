@@ -7,23 +7,24 @@ import (
 )
 
 type linuxTUN struct {
-	name string
+    name string
 }
 
-func CreateTUN(name string, mtu int) (TUNDevice, error) {
-	// Delete if exists
-	_ = exec.Command("ip", "link", "delete", name).Run()
+func (t *linuxTUN) Create(name string, mtu int) error {
+    // Delete if exists
+    _ = exec.Command("ip", "link", "delete", name).Run()
 
-	// Create real WireGuard interface (not raw TUN)
-	out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("linux tun create: create interface: %w: %s", err, strings.TrimSpace(string(out)))
-	}
+    // Create real WireGuard interface (not raw TUN)
+    out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput()
+    if err != nil {
+        return fmt.Errorf("linux tun create: create interface: %w: %s", err, strings.TrimSpace(string(out)))
+    }
 
-	// Set MTU
-	_ = exec.Command("ip", "link", "set", name, "mtu", fmt.Sprintf("%d", mtu)).Run()
+    // Set MTU
+    _ = exec.Command("ip", "link", "set", name, "mtu", fmt.Sprintf("%d", mtu)).Run()
 
-	return &linuxTUN{name: name}, nil
+    t.name = name
+    return nil
 }
 
 func (t *linuxTUN) Name() string { return t.name }
