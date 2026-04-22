@@ -166,6 +166,10 @@ export const networkApi = {
 
   async deleteNetwork(id: string) {
     await api.delete(`/api/v1/networks/${id}`);
+  },
+
+  async kickMember(networkId: string, memberId: string) {
+    await api.delete(`/api/v1/networks/${networkId}/members/${memberId}`);
   }
 };
 

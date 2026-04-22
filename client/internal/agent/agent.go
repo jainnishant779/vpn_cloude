@@ -230,6 +230,7 @@ func (a *Agent) Start() error {
 	a.state.Set(StateConnecting)
 	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, peerID)
 	a.peerMgr.Start()
+	a.startPacketForwarding()
 
 	a.wg.Add(3)
 	go func() { defer a.wg.Done(); a.heartbeatLoop(useMemberToken) }()
@@ -480,4 +481,64 @@ func isLocalPortOpen(port int) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+func (a *Agent) startPacketForwarding() {
+	conn := a.holePuncher.Conn()
+	if conn == nil {
+		return
+	}
+	// outbound: TUN → UDP
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 65536)
+		magic := []byte{0x51, 0x54, 0x44, 0x54}
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+			n, err := a.tunnel.ReadPacket(buf)
+			if err != nil || n < 20 {
+				continue
+			}
+			destIP := net.IP(buf[16:20]).String()
+			endpoint, ok := a.tunnel.FindEndpointByVirtualIP(destIP)
+			if !ok {
+				continue
+			}
+			peerAddr, err := net.ResolveUDPAddr("udp", endpoint)
+			if err != nil {
+				continue
+			}
+			pkt := make([]byte, 4+n)
+			copy(pkt, magic)
+			copy(pkt[4:], buf[:n])
+			_, _ = conn.WriteToUDP(pkt, peerAddr)
+		}
+	}()
+	// inbound: UDP → TUN
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 65536)
+		magic := []byte{0x51, 0x54, 0x44, 0x54}
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil || n < 24 {
+				continue
+			}
+			if buf[0] != magic[0] || buf[1] != magic[1] || buf[2] != magic[2] || buf[3] != magic[3] {
+				continue
+			}
+			_, _ = a.tunnel.WritePacket(buf[4:n])
+		}
+	}()
 }

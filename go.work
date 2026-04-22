@@ -1,8 +1,8 @@
 go 1.21
 
 use (
-	./server
-	./relay
 	./client
 	./pkg
+	./relay
+	./server
 )

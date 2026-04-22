@@ -77,7 +77,7 @@ services:
           cpus: "0.50"
           memory: 512M
     logging:
-      driver: "none"
+      driver: "json-file"
 
   relay:
     build:
