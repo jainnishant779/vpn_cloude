@@ -182,24 +182,47 @@ fuser -k 51820/udp 2>/dev/null || true
 rm -f /usr/local/bin/quicktunnel
 sleep 1
 
-# ── WireGuard kernel module (Linux only) ─────────────────────────────────
+# ── WireGuard setup (Linux only) ─────────────────────────────────────────
 if [ "$OS" = "linux" ]; then
-  if ! lsmod | grep -q wireguard; then
-    modprobe wireguard 2>/dev/null || true
+  WG_READY=false
+
+  # Try kernel module first
+  if lsmod | grep -q wireguard 2>/dev/null; then
+    WG_READY=true
+  elif modprobe wireguard 2>/dev/null; then
+    WG_READY=true
   fi
-  # If still not loaded, install wireguard-tools
-  if ! lsmod | grep -q wireguard && ! ip link add wg_test type wireguard 2>/dev/null; then
-    echo "[*] Installing WireGuard..."
+
+  # Install wireguard-tools if not present
+  if ! command -v wg &>/dev/null; then
+    echo "[*] Installing wireguard-tools..."
     if command -v apt-get &>/dev/null; then
-      apt-get update -qq && apt-get install -y -qq wireguard-tools wireguard 2>/dev/null || apt-get install -y -qq wireguard-tools 2>/dev/null || true
+      apt-get update -qq && apt-get install -y -qq wireguard-tools 2>/dev/null || true
     elif command -v dnf &>/dev/null; then
       dnf install -y wireguard-tools 2>/dev/null || true
     elif command -v yum &>/dev/null; then
       yum install -y wireguard-tools 2>/dev/null || true
     fi
-    modprobe wireguard 2>/dev/null || true
-  else
-    ip link delete wg_test 2>/dev/null || true
+  fi
+
+  # If kernel module still not available, install wireguard-go (userspace)
+  if [ "$WG_READY" = "false" ]; then
+    echo "[*] Kernel module unavailable (custom kernel?), installing wireguard-go..."
+    if command -v apt-get &>/dev/null; then
+      apt-get install -y -qq wireguard-go 2>/dev/null || true
+    fi
+    # If apt didn't have it, try go install
+    if ! command -v wireguard-go &>/dev/null; then
+      if command -v go &>/dev/null; then
+        GOBIN=/usr/local/bin go install golang.zx2c4.com/wireguard-go@latest 2>/dev/null || true
+      fi
+    fi
+    if command -v wireguard-go &>/dev/null; then
+      echo "      wireguard-go installed (userspace mode)"
+    else
+      echo "[!] Warning: WireGuard kernel module and wireguard-go both unavailable"
+      echo "    Install manually: apt install wireguard-go  OR  go install golang.zx2c4.com/wireguard-go@latest"
+    fi
   fi
 fi
 
