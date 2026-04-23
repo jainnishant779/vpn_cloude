@@ -187,6 +187,20 @@ if [ "$OS" = "linux" ]; then
   if ! lsmod | grep -q wireguard; then
     modprobe wireguard 2>/dev/null || true
   fi
+  # If still not loaded, install wireguard-tools
+  if ! lsmod | grep -q wireguard && ! ip link add wg_test type wireguard 2>/dev/null; then
+    echo "[*] Installing WireGuard..."
+    if command -v apt-get &>/dev/null; then
+      apt-get update -qq && apt-get install -y -qq wireguard-tools wireguard 2>/dev/null || apt-get install -y -qq wireguard-tools 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+      dnf install -y wireguard-tools 2>/dev/null || true
+    elif command -v yum &>/dev/null; then
+      yum install -y wireguard-tools 2>/dev/null || true
+    fi
+    modprobe wireguard 2>/dev/null || true
+  else
+    ip link delete wg_test 2>/dev/null || true
+  fi
 fi
 
 # ── Download binary ───────────────────────────────────────────────────────
