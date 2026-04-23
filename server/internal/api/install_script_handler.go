@@ -25,15 +25,29 @@ func NewInstallScriptHandler(serverURL string) *InstallScriptHandler {
 	}
 }
 
+// deriveServerURL determines the server URL to embed in install scripts.
+// It prioritizes the request's Host header (the URL the user actually used)
+// and only falls back to the configured PUBLIC_SERVER_URL if needed.
 func (h *InstallScriptHandler) deriveServerURL(r *http.Request) string {
+	// Prefer the Host header from the actual request — this is the address
+	// the user typed (e.g. 3.93.45.218:3000), so it's always reachable.
+	if host := r.Host; host != "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		// Check for X-Forwarded-Proto behind reverse proxies
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		}
+		return fmt.Sprintf("%s://%s", scheme, host)
+	}
+
+	// Fallback to configured PUBLIC_SERVER_URL
 	if h.serverURL != "" {
 		return h.serverURL
 	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return fmt.Sprintf("%s://%s", scheme, r.Host)
+	return "http://localhost:3000"
 }
 
 // ServeScript handles GET /install.sh
