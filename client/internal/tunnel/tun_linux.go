@@ -13,8 +13,8 @@ import (
 )
 
 type LinuxWGDevice struct {
-	name       string
-	wgGoProc   *os.Process // wireguard-go process (userspace fallback)
+	name        string
+	wgGoProc    *os.Process // wireguard-go process (userspace fallback)
 	isUserspace bool
 }
 
@@ -33,49 +33,57 @@ func hasWireGuardKernelModule() bool {
 	return false
 }
 
-// findWireGuardGo looks for wireguard-go or boringtun in PATH and common locations.
-func findWireGuardGo() string {
-	for _, name := range []string{"wireguard-go", "boringtun", "boringtun-cli"} {
-		if path, err := exec.LookPath(name); err == nil {
-			return path
-		}
-	}
-	// Check common install locations
-	for _, path := range []string{
+// resolveWireGuardGo finds the wireguard-go binary by checking multiple locations.
+func resolveWireGuardGo() string {
+	// Check explicit known paths first (most reliable under sudo)
+	candidates := []string{
 		"/usr/bin/wireguard-go",
 		"/usr/local/bin/wireguard-go",
+		"/usr/sbin/wireguard-go",
+		"/snap/bin/wireguard-go",
 		"/usr/bin/boringtun",
 		"/usr/local/bin/boringtun",
-	} {
-		if _, err := os.Stat(path); err == nil {
-			return path
+		"/usr/bin/boringtun-cli",
+		"/usr/local/bin/boringtun-cli",
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	// Try PATH-based lookup as fallback
+	for _, name := range []string{"wireguard-go", "boringtun", "boringtun-cli"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
 		}
 	}
 	return ""
 }
 
-// installWireGuardGo attempts to download and install wireguard-go.
-func installWireGuardGo() (string, error) {
-	// Try apt first
+// tryInstallWireGuardGo attempts to install wireguard-go via package manager.
+func tryInstallWireGuardGo() string {
+	// Try apt
 	if _, err := exec.LookPath("apt-get"); err == nil {
 		_ = exec.Command("apt-get", "update", "-qq").Run()
-		if err := exec.Command("apt-get", "install", "-y", "-qq", "wireguard-go").Run(); err == nil {
-			if path, err := exec.LookPath("wireguard-go"); err == nil {
-				return path, nil
+		_ = exec.Command("apt-get", "install", "-y", "-qq", "wireguard-go").Run()
+		// Check the known path immediately
+		if info, err := os.Stat("/usr/bin/wireguard-go"); err == nil && !info.IsDir() {
+			return "/usr/bin/wireguard-go"
+		}
+	}
+	// Try go install if go is available
+	for _, goPath := range []string{"/usr/local/go/bin/go", "/usr/bin/go"} {
+		if _, err := os.Stat(goPath); err == nil {
+			cmd := exec.Command(goPath, "install", "golang.zx2c4.com/wireguard-go@latest")
+			cmd.Env = append(os.Environ(), "GOBIN=/usr/local/bin", "GOPATH=/tmp/gopath")
+			if err := cmd.Run(); err == nil {
+				if info, err := os.Stat("/usr/local/bin/wireguard-go"); err == nil && !info.IsDir() {
+					return "/usr/local/bin/wireguard-go"
+				}
 			}
 		}
 	}
-
-	// Try go install if go is available
-	if goPath, err := exec.LookPath("go"); err == nil {
-		cmd := exec.Command(goPath, "install", "golang.zx2c4.com/wireguard-go@latest")
-		cmd.Env = append(os.Environ(), "GOBIN=/usr/local/bin")
-		if err := cmd.Run(); err == nil {
-			return "/usr/local/bin/wireguard-go", nil
-		}
-	}
-
-	return "", fmt.Errorf("wireguard-go not found and could not be installed")
+	return ""
 }
 
 func (d *LinuxWGDevice) Create(name string, mtu int) error {
@@ -93,48 +101,39 @@ func (d *LinuxWGDevice) Create(name string, mtu int) error {
 			d.isUserspace = false
 			return nil
 		}
-		// Log but continue to userspace fallback
-		_ = out
+		_ = out // kernel module loaded but ip link failed — continue to userspace
 	}
 
 	// Fallback: use wireguard-go (userspace WireGuard)
-	wgGoPath := findWireGuardGo()
+	wgGoPath := resolveWireGuardGo()
 	if wgGoPath == "" {
-		var err error
-		wgGoPath, err = installWireGuardGo()
-		if err != nil {
-			return fmt.Errorf("create wireguard device: kernel module unavailable and %w", err)
-		}
+		wgGoPath = tryInstallWireGuardGo()
+	}
+	if wgGoPath == "" {
+		return fmt.Errorf("create wireguard device: WireGuard kernel module unavailable and wireguard-go not found.\n" +
+			"  Fix: sudo apt install wireguard-go\n" +
+			"  Or:  download Go 1.22+ and run: sudo GOBIN=/usr/local/bin go install golang.zx2c4.com/wireguard-go@latest")
 	}
 
-	// Create TUN device first (wireguard-go needs it)
-	out, err := exec.Command("ip", "tuntap", "add", "mode", "tun", name).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "exists") {
-		// Some systems need a different approach
-		_ = out
-	}
-
-	// Start wireguard-go with the interface name
+	// Start wireguard-go — it creates its own TUN interface
 	cmd := exec.Command(wgGoPath, name)
-	cmd.Env = append(os.Environ(),
-		"WG_TUN_FD=",  // Let wireguard-go create its own TUN
-		"LOG_LEVEL=info",
-	)
-	// Delete the tuntap device — wireguard-go creates its own
-	_ = exec.Command("ip", "link", "delete", name).Run()
+	cmd.Env = append(os.Environ(), "LOG_LEVEL=info")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("create wireguard device: start wireguard-go: %w", err)
+		return fmt.Errorf("create wireguard device: start wireguard-go (%s): %w", wgGoPath, err)
 	}
 
 	d.wgGoProc = cmd.Process
 	d.name = name
 	d.isUserspace = true
 
-	// Wait briefly for the interface to appear
-	for i := 0; i < 20; i++ {
+	// Wait for the interface to appear (wireguard-go creates it)
+	for i := 0; i < 30; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if _, err := exec.Command("ip", "link", "show", name).CombinedOutput(); err == nil {
+		if out, err := exec.Command("ip", "link", "show", name).CombinedOutput(); err == nil {
+			_ = out
 			break
 		}
 	}
