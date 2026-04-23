@@ -19,7 +19,8 @@ sleep 1
 
 # Start server
 cd ~/vpn
-sudo nohup ./server/quicktunnel-server > server.log 2>&1 < /dev/null &
+export PUBLIC_SERVER_URL="http://3.93.45.218:3000"
+sudo -E nohup ./server/quicktunnel-server > server.log 2>&1 < /dev/null &
 echo "Server restarted (PID: $!)"
 
 # Restart client tunnel if installed as service

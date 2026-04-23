@@ -26,27 +26,40 @@ func NewInstallScriptHandler(serverURL string) *InstallScriptHandler {
 }
 
 // deriveServerURL determines the server URL to embed in install scripts.
-// It prioritizes the request's Host header (the URL the user actually used)
-// and only falls back to the configured PUBLIC_SERVER_URL if needed.
+// Behind NGINX, r.Host loses the port (3.93.45.218:3000 → 3.93.45.218).
+// We use a 3-tier approach:
+//  1. X-Forwarded-Host (set by NGINX, preserves the original host:port)
+//  2. PUBLIC_SERVER_URL config (has the correct port)
+//  3. r.Host fallback (may be missing port behind a reverse proxy)
 func (h *InstallScriptHandler) deriveServerURL(r *http.Request) string {
-	// Prefer the Host header from the actual request — this is the address
-	// the user typed (e.g. 3.93.45.218:3000), so it's always reachable.
-	if host := r.Host; host != "" {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		// Check for X-Forwarded-Proto behind reverse proxies
-		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-			scheme = proto
-		}
-		return fmt.Sprintf("%s://%s", scheme, host)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
 	}
 
-	// Fallback to configured PUBLIC_SERVER_URL
+	// 1. X-Forwarded-Host preserves the original host:port from NGINX
+	if fwdHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); fwdHost != "" {
+		return fmt.Sprintf("%s://%s", scheme, fwdHost)
+	}
+
+	// 2. If r.Host includes a non-standard port, use it directly
+	if r.Host != "" && strings.Contains(r.Host, ":") {
+		return fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+
+	// 3. PUBLIC_SERVER_URL — has the correct IP:port from config
 	if h.serverURL != "" {
 		return h.serverURL
 	}
+
+	// 4. Bare r.Host (port 80/443 implied)
+	if r.Host != "" {
+		return fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+
 	return "http://localhost:3000"
 }
 
