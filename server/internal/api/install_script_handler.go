@@ -122,8 +122,42 @@ fi`, serverURL, serverURL)
 # Usage: curl %s/join/<network_id> | sudo bash
 set -euo pipefail
 
-SERVER_URL="%s"
+_SERVER_URL="%s"
 %s
+
+# ── Auto-detect correct server port ──────────────────────────────────────
+# NGINX proxy may strip the port. Try the URL as-is first, then common ports.
+detect_server_url() {
+  local url="$1"
+  # If URL already has a non-standard port, use it
+  if echo "$url" | grep -qE ':[0-9]+$'; then
+    echo "$url"
+    return
+  fi
+  # Try the URL as-is (port 80)
+  if curl -fsS --connect-timeout 3 "$url/health" >/dev/null 2>&1; then
+    echo "$url"
+    return
+  fi
+  # Try common ports: 3000, 8080
+  local host
+  host=$(echo "$url" | sed 's|^https\?://||')
+  for port in 3000 8080; do
+    local candidate
+    candidate=$(echo "$url" | sed "s|://.*|://${host}:${port}|")
+    if curl -fsS --connect-timeout 3 "$candidate/health" >/dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+  done
+  # Give up, return original
+  echo "$url"
+}
+
+SERVER_URL=$(detect_server_url "$_SERVER_URL")
+if [ "$SERVER_URL" != "$_SERVER_URL" ]; then
+  echo "[*] Auto-detected server at $SERVER_URL"
+fi
 
 # ── Detect platform ─────────────────────────────────────────────────────
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
