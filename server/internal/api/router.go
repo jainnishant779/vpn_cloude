@@ -93,7 +93,6 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 	r.Get("/install.sh", installHandler.ServeScript)
 	r.Head("/install.sh", installHandler.ServeScript)
 	r.Get("/join/{network_id}", installHandler.ServeJoin)
-	// Windows PowerShell one-liner
 	r.Get("/join/{network_id}/ps1", installHandler.ServeJoinPS1)
 
 	// ── Health ───────────────────────────────────────────────────────────────
