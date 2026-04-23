@@ -176,7 +176,32 @@ func (m *PeerManager) syncPeersOnce() error {
 
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string) string {
-	// Check if public endpoint is IPv4 (not bracketed IPv6)
+	// 1. Check if any local endpoint is on the same subnet as us (same LAN)
+	addrs, _ := net.InterfaceAddrs()
+	for _, ep := range localEndpoints {
+		peerHost, _, err := net.SplitHostPort(ep)
+		if err != nil {
+			peerHost = ep
+		}
+		peerIP := net.ParseIP(peerHost)
+		if peerIP == nil || peerIP.To4() == nil {
+			continue
+		}
+		
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				// Simple /24 subnet match for LAN detection
+				if ipnet.IP.To4()[0] == peerIP.To4()[0] && ipnet.IP.To4()[1] == peerIP.To4()[1] && ipnet.IP.To4()[2] == peerIP.To4()[2] {
+					if !strings.Contains(ep, ":") {
+						return ep + ":51820"
+					}
+					return ep
+				}
+			}
+		}
+	}
+
+	// 2. Check if public endpoint is IPv4 (not bracketed IPv6)
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
 		// Also verify it's actually IPv4 and has a port
 		host, _, err := net.SplitHostPort(publicEndpoint)
