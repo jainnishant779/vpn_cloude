@@ -176,7 +176,7 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("agent start: start tunnel: %w", err)
 	}
 
-	a.holePuncher, err = nat.NewHolePuncher(maxInt(a.config.WGListenPort, 51820))
+	a.holePuncher, err = nat.NewHolePuncher(0)
 	if err != nil {
 		return fmt.Errorf("agent start: create hole puncher: %w", err)
 	}
