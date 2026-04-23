@@ -275,7 +275,7 @@ func (s *PeerStore) UpdatePeerStatus(ctx context.Context, peerID string, status 
 	const query = `
 UPDATE peers
 SET public_endpoint = $2,
-		local_endpoints = COALESCE($3, '{}'::text[]),
+		local_endpoints = COALESCE($3::text[], '{}'::text[]),
     vnc_available = $4,
     rx_bytes = $5,
     tx_bytes = $6,
