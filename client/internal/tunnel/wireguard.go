@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -21,9 +20,9 @@ type TunnelStats struct {
 
 type PeerConfig struct {
 	PublicKey     string
-	Endpoint      string
-	AllowedIP     string
-	AddedAt       time.Time
+	Endpoint     string
+	AllowedIP    string
+	AddedAt      time.Time
 	LastHandshake time.Time
 }
 
@@ -34,12 +33,39 @@ type WGTunnel struct {
 	listenPort int
 	deviceName string
 	mtu        int
+	wgReady    bool
 
 	mu      sync.RWMutex
 	started bool
 	device  TUNDevice
 	peers   map[string]*PeerConfig
 	stats   TunnelStats
+}
+
+// networkAddr returns the network address for a given IP and mask bits.
+func networkAddr(ip string, maskBits int) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	mask := net.CIDRMask(maskBits, 32)
+	return parsed.Mask(mask).String()
+}
+
+// runWGCmd runs a shell command and logs warnings on failure.
+func runWGCmd(description, command string) error {
+	out, err := exec.Command("sh", "-c", command).CombinedOutput()
+	if err != nil {
+		fmt.Printf("[WARN] %s failed: %s — %v\n", description, strings.TrimSpace(string(out)), err)
+		return err
+	}
+	return nil
+}
+
+// checkWGAvailable checks if wireguard-tools is installed.
+func checkWGAvailable() bool {
+	_, err := exec.LookPath("wg")
+	return err == nil
 }
 
 func NewWGTunnel(privateKey, virtualIP, cidr string, listenPort int) (*WGTunnel, error) {
@@ -76,7 +102,6 @@ func (w *WGTunnel) Start() error {
 		return nil
 	}
 
-	// Create WireGuard interface (tun_linux.go handles ip link add type wireguard)
 	device, err := CreateTUN(w.deviceName, w.mtu)
 	if err != nil {
 		return fmt.Errorf("wg tunnel start: create tun: %w", err)
@@ -88,42 +113,33 @@ func (w *WGTunnel) Start() error {
 	w.device = device
 	w.deviceName = device.Name()
 
-	// Set private key + listen port using wg command
-	// Write key to temp file to avoid shell escaping issues
-	tmpFile, err := os.CreateTemp("", "wgkey-*")
-	if err == nil {
-		_, _ = tmpFile.WriteString(w.privateKey)
-		_ = tmpFile.Close()
+	// Real WireGuard kernel setup — safe stdin pipe (no shell injection)
+	if checkWGAvailable() {
 		cmd := exec.Command("wg", "set", w.deviceName,
 			"listen-port", fmt.Sprintf("%d", w.listenPort),
-			"private-key", tmpFile.Name())
+			"private-key", "/dev/stdin")
+		cmd.Stdin = strings.NewReader(w.privateKey)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			// wg command failed — log but don't fatal (ping may still work via raw TUN)
-			_ = out
+			fmt.Printf("[WARN] wg set interface failed: %s — %v\n", strings.TrimSpace(string(out)), err)
+		} else {
+			w.wgReady = true
+			fmt.Printf("[INFO] WireGuard kernel module active on %s\n", w.deviceName)
 		}
-		_ = os.Remove(tmpFile.Name())
+	} else {
+		fmt.Println("[WARN] wireguard-tools not installed — raw TUN mode (ICMP only)")
+		fmt.Println("[WARN] Install: sudo apt install wireguard-tools")
 	}
 
-	// Add VPN subnet route
-	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	// Enable IP forwarding + subnet route
+	_ = exec.Command("sh", "-c", "sysctl -w net.ipv4.ip_forward=1").Run()
 	maskBits, _ := maskBitsFromCIDR(w.cidr)
-	netAddr := networkAddr(w.virtualIP, maskBits)
-	_ = exec.Command("sh", "-c",
-		fmt.Sprintf("ip route replace %s/%d dev %s 2>/dev/null || true", netAddr, maskBits, w.deviceName),
-	).Run()
+	routeCmd := fmt.Sprintf("ip route replace %s/%d dev %s 2>/dev/null || true",
+		networkAddr(w.virtualIP, maskBits), maskBits, w.deviceName)
+	_ = runWGCmd("add subnet route", routeCmd)
 
 	w.started = true
 	w.stats.LastHandshake = time.Now().UTC()
 	return nil
-}
-
-func networkAddr(ip string, maskBits int) string {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return ip
-	}
-	mask := net.CIDRMask(maskBits, 32)
-	return parsed.Mask(mask).String()
 }
 
 func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
@@ -142,34 +158,34 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 		return fmt.Errorf("add peer: allowed ip is required")
 	}
 
-	now := time.Now().UTC()
-	w.peers[publicKey] = &PeerConfig{
-		PublicKey:     publicKey,
-		Endpoint:      endpoint,
-		AllowedIP:     allowedIP,
-		AddedAt:       now,
-		LastHandshake: now,
-	}
-	w.stats.LastHandshake = now
-
+	// Normalize BEFORE storing
 	if !strings.Contains(allowedIP, "/") {
 		allowedIP += "/32"
 	}
 
-	// Configure peer in kernel WireGuard — this enables full TCP/UDP
-	cmd := exec.Command("wg", "set", w.deviceName,
-		"peer", publicKey,
-		"endpoint", endpoint,
-		"allowed-ips", allowedIP,
-		"persistent-keepalive", "25",
-	)
-	_ = cmd.Run()
+	now := time.Now().UTC()
+	w.peers[publicKey] = &PeerConfig{
+		PublicKey:     publicKey,
+		Endpoint:     endpoint,
+		AllowedIP:    allowedIP,
+		AddedAt:      now,
+		LastHandshake: now,
+	}
+	w.stats.LastHandshake = now
 
-	// Add host route so OS sends traffic through tunnel
+	// Inject peer into kernel WireGuard
+	if w.wgReady {
+		cmd := fmt.Sprintf(
+			"wg set %s peer %s endpoint %s allowed-ips %s persistent-keepalive 25",
+			w.deviceName, publicKey, endpoint, allowedIP,
+		)
+		_ = runWGCmd("add wg peer", cmd)
+	}
+
+	// Host route for peer
 	peerIP := strings.Split(allowedIP, "/")[0]
-	_ = exec.Command("sh", "-c",
-		fmt.Sprintf("ip route replace %s dev %s 2>/dev/null || true", peerIP, w.deviceName),
-	).Run()
+	routeCmd := fmt.Sprintf("ip route replace %s dev %s 2>/dev/null || true", peerIP, w.deviceName)
+	_ = runWGCmd("add peer route", routeCmd)
 
 	return nil
 }
@@ -180,10 +196,25 @@ func (w *WGTunnel) RemovePeer(publicKey string) error {
 	if !w.started {
 		return fmt.Errorf("remove peer: tunnel is not started")
 	}
-	if _, exists := w.peers[publicKey]; !exists {
+	if strings.TrimSpace(publicKey) == "" {
+		return fmt.Errorf("remove peer: public key is required")
+	}
+	peer, exists := w.peers[publicKey]
+	if !exists {
 		return fmt.Errorf("remove peer: peer not found")
 	}
-	_ = exec.Command("wg", "set", w.deviceName, "peer", publicKey, "remove").Run()
+
+	// Remove from kernel
+	if w.wgReady {
+		cmd := fmt.Sprintf("wg set %s peer %s remove", w.deviceName, publicKey)
+		_ = runWGCmd("remove wg peer", cmd)
+	}
+
+	// Clean up route
+	peerIP := strings.Split(peer.AllowedIP, "/")[0]
+	routeCmd := fmt.Sprintf("ip route del %s dev %s 2>/dev/null || true", peerIP, w.deviceName)
+	_ = runWGCmd("remove peer route", routeCmd)
+
 	delete(w.peers, publicKey)
 	return nil
 }
@@ -201,7 +232,11 @@ func (w *WGTunnel) UpdatePeerEndpoint(publicKey, newEndpoint string) error {
 	peer.Endpoint = newEndpoint
 	peer.LastHandshake = time.Now().UTC()
 	w.stats.LastHandshake = peer.LastHandshake
-	_ = exec.Command("wg", "set", w.deviceName, "peer", publicKey, "endpoint", newEndpoint).Run()
+
+	if w.wgReady {
+		cmd := fmt.Sprintf("wg set %s peer %s endpoint %s", w.deviceName, publicKey, newEndpoint)
+		_ = runWGCmd("update peer endpoint", cmd)
+	}
 	return nil
 }
 
@@ -229,9 +264,18 @@ func (w *WGTunnel) Stop() error {
 	if !w.started {
 		return nil
 	}
-	for pubKey := range w.peers {
-		_ = exec.Command("wg", "set", w.deviceName, "peer", pubKey, "remove").Run()
+
+	// Clean up all peers
+	for pubKey, peer := range w.peers {
+		if w.wgReady {
+			cmd := fmt.Sprintf("wg set %s peer %s remove", w.deviceName, pubKey)
+			_ = runWGCmd("stop: remove wg peer", cmd)
+		}
+		peerIP := strings.Split(peer.AllowedIP, "/")[0]
+		routeCmd := fmt.Sprintf("ip route del %s dev %s 2>/dev/null || true", peerIP, w.deviceName)
+		_ = runWGCmd("stop: remove peer route", routeCmd)
 	}
+
 	if w.device != nil {
 		if err := w.device.Close(); err != nil {
 			return fmt.Errorf("wg tunnel stop: close tun device: %w", err)
@@ -240,6 +284,7 @@ func (w *WGTunnel) Stop() error {
 	w.device = nil
 	w.peers = make(map[string]*PeerConfig)
 	w.started = false
+	w.wgReady = false
 	return nil
 }
 

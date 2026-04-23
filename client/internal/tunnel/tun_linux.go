@@ -14,6 +14,19 @@ type LinuxWGDevice struct {
 	name string
 }
 
+func (d *LinuxWGDevice) Create(name string, mtu int) error {
+	_ = exec.Command("ip", "link", "delete", name).Run()
+	out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("create wireguard device: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if mtu > 0 {
+		_ = exec.Command("ip", "link", "set", name, "mtu", strconv.Itoa(mtu)).Run()
+	}
+	d.name = name
+	return nil
+}
+
 func (d *LinuxWGDevice) Configure(ip string, cidr string) error {
 	maskBits, err := maskBitsFromCIDR(cidr)
 	if err != nil {
@@ -40,15 +53,11 @@ func (d *LinuxWGDevice) Close() error {
 }
 
 func CreateTUN(name string, mtu int) (TUNDevice, error) {
-	_ = exec.Command("ip", "link", "delete", name).Run()
-	out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("linux tun create: create interface: %w: %s", err, strings.TrimSpace(string(out)))
+	dev := &LinuxWGDevice{}
+	if err := dev.Create(name, mtu); err != nil {
+		return nil, fmt.Errorf("linux tun create: %w", err)
 	}
-	if mtu > 0 {
-		_ = exec.Command("ip", "link", "set", name, "mtu", strconv.Itoa(mtu)).Run()
-	}
-	return &LinuxWGDevice{name: name}, nil
+	return dev, nil
 }
 
 func ConfigureTUN(name string, ip string, cidr string) error {
@@ -61,13 +70,4 @@ func SetMTU(name string, mtu int) error {
 
 func DestroyTUN(name string) error {
 	return exec.Command("ip", "link", "delete", name).Run()
-}
-
-func runCommand(command string, args ...string) error {
-	cmd := exec.Command(command, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("run command %s %v: %w (output: %s)", command, args, err, string(output))
-	}
-	return nil
 }
