@@ -9,9 +9,9 @@ import (
 	"strings"
 )
 
-func enableIPForwarding() {
+func enableIPForwarding(deviceName string) {
 	_ = exec.Command("powershell", "-Command",
-		"Set-NetIPInterface -Forwarding Enabled").Run()
+		fmt.Sprintf("Set-NetIPInterface -InterfaceAlias \"%s\" -Forwarding Enabled", deviceName)).Run()
 }
 
 func addSubnetRoute(networkCIDR, deviceName string) error {
@@ -44,17 +44,19 @@ func removeHostRoute(peerIP, deviceName string) error {
 	return nil
 }
 
-func configureWG(deviceName, privateKey string, listenPort int) (bool, error) {
-	// Windows WireGuard uses config files, not wg set
-	// Write temp config and install tunnel service
-	_, err := exec.LookPath("wireguard.exe")
-	if err != nil {
-		return false, fmt.Errorf("wireguard.exe not found")
-	}
-	// For now, attempt wg.exe if available
-	wgPath, err := exec.LookPath("wg")
-	if err != nil {
-		return false, fmt.Errorf("wg.exe not found")
+func configureWG(deviceName, privateKey string, listenPort int, wgPath string) (bool, error) {
+	if wgPath == "" {
+		// Try wg first, if not found, we can't configure kernel wg
+		path, err := exec.LookPath("wg")
+		if err != nil {
+			path, err = exec.LookPath("wireguard.exe")
+			if err != nil {
+				return false, fmt.Errorf("wg.exe not found")
+			}
+			wgPath = path
+		} else {
+			wgPath = path
+		}
 	}
 	cmd := exec.Command(wgPath, "set", deviceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
@@ -67,8 +69,11 @@ func configureWG(deviceName, privateKey string, listenPort int) (bool, error) {
 	return true, nil
 }
 
-func addWGPeer(deviceName, publicKey, endpoint, allowedIP string) error {
-	out, err := exec.Command("wg", "set", deviceName,
+func addWGPeer(deviceName, publicKey, endpoint, allowedIP string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	out, err := exec.Command(wgPath, "set", deviceName,
 		"peer", publicKey,
 		"endpoint", endpoint,
 		"allowed-ips", allowedIP,
@@ -80,8 +85,11 @@ func addWGPeer(deviceName, publicKey, endpoint, allowedIP string) error {
 	return nil
 }
 
-func removeWGPeer(deviceName, publicKey string) error {
-	out, err := exec.Command("wg", "set", deviceName,
+func removeWGPeer(deviceName, publicKey string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	out, err := exec.Command(wgPath, "set", deviceName,
 		"peer", publicKey, "remove").CombinedOutput()
 	if err != nil {
 		fmt.Printf("[WARN] remove wg peer failed: %s — %v\n", strings.TrimSpace(string(out)), err)
@@ -90,8 +98,11 @@ func removeWGPeer(deviceName, publicKey string) error {
 	return nil
 }
 
-func updateWGPeerEndpoint(deviceName, publicKey, endpoint string) error {
-	out, err := exec.Command("wg", "set", deviceName,
+func updateWGPeerEndpoint(deviceName, publicKey, endpoint string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	out, err := exec.Command(wgPath, "set", deviceName,
 		"peer", publicKey,
 		"endpoint", endpoint).CombinedOutput()
 	if err != nil {

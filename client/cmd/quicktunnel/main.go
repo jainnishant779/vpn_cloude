@@ -89,15 +89,6 @@ func normalizeServerURL(raw string) string {
 	return "http://" + raw
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// JOIN  — ZeroTier-style
-//
-//   quicktunnel join <server> <network_id>
-//   quicktunnel join 54.89.232.16 5agrlxob7exh
-//
-// No API key. Generates WireGuard keys, POST /api/v1/join,
-// polls for approval if pending, then starts tunnel.
-// ─────────────────────────────────────────────────────────────────────────────
 func runJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	nameFlag := fs.String("name", "", "Device name (optional)")
@@ -106,9 +97,7 @@ func runJoin(args []string) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf(
-			"Usage: quicktunnel join <server> <network_id>\n" +
-			"  e.g. quicktunnel join 54.89.232.16 5agrlxob7exh")
+		return fmt.Errorf("Usage: quicktunnel join <server> <network_id>\n  e.g. quicktunnel join vpn.example.com 5agrlxob7exh")
 	}
 
 	serverURL := normalizeServerURL(rest[0])
@@ -117,7 +106,6 @@ func runJoin(args []string) error {
 	fmt.Printf("Server  : %s\n", serverURL)
 	fmt.Printf("Network : %s\n", networkID)
 
-	// Device name
 	deviceName := strings.TrimSpace(*nameFlag)
 	if deviceName == "" {
 		deviceName, _ = os.Hostname()
@@ -126,7 +114,6 @@ func runJoin(args []string) error {
 		deviceName = "unknown-device"
 	}
 
-	// Generate WireGuard key pair
 	fmt.Print("Generating WireGuard keys... ")
 	privKey, pubKey, err := pkgcrypto.GenerateKeyPair()
 	if err != nil {
@@ -134,7 +121,6 @@ func runJoin(args []string) error {
 	}
 	fmt.Println("done")
 
-	// POST /api/v1/join  (no auth required)
 	type joinReq struct {
 		NetworkID   string `json:"network_id"`
 		Hostname    string `json:"hostname"`
@@ -158,19 +144,29 @@ func runJoin(args []string) error {
 	}
 
 	doPost := func() (*joinResp, error) {
-		body, _ := json.Marshal(joinReq{
+		body, err := json.Marshal(joinReq{
 			NetworkID:   networkID,
 			Hostname:    deviceName,
 			WGPublicKey: pubKey,
 			OS:          runtime.GOOS,
 			Arch:        runtime.GOARCH,
 		})
-		resp, err := http.Post(serverURL+"/api/v1/join", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Post(serverURL+"/api/v1/join", "application/json", bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("cannot reach server: %w", err)
 		}
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
+
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+
 		var env envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
 			return nil, fmt.Errorf("parse response: %w", err)
@@ -192,7 +188,6 @@ func runJoin(args []string) error {
 	}
 	fmt.Printf("status=%s\n", jr.Status)
 
-	// ── Poll for approval if pending ──────────────────────────────────────────
 	if jr.Status == "pending" {
 		fmt.Printf("\n⏳ Waiting for admin to approve in dashboard (network: %s)\n", jr.NetworkName)
 		fmt.Println("   Dashboard → Networks → Members → Approve")
@@ -210,22 +205,28 @@ func runJoin(args []string) error {
 		dots := 0
 		for {
 			time.Sleep(4 * time.Second)
-			req, _ := http.NewRequest("GET",
-				fmt.Sprintf("%s/api/v1/members/%s/status", serverURL, jr.MemberID), nil)
+			req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/members/%s/status", serverURL, jr.MemberID), nil)
+			if err != nil {
+				continue
+			}
 			req.Header.Set("Authorization", "Bearer "+jr.MemberToken)
 			r, err := client.Do(req)
 			if err != nil {
 				fmt.Print("?")
 				continue
 			}
-			raw, _ := io.ReadAll(r.Body)
+			
+			raw, err := io.ReadAll(r.Body)
 			r.Body.Close()
+			if err != nil {
+				continue
+			}
 
 			var se statusEnv
 			if json.Unmarshal(raw, &se) == nil && se.Success {
 				switch se.Data.Status {
 				case "approved":
-					jr.Status    = "approved"
+					jr.Status = "approved"
 					jr.VirtualIP = se.Data.VirtualIP
 					fmt.Println("\n✓ Approved!")
 					goto approved
@@ -252,7 +253,6 @@ approved:
 	fmt.Printf("✓ Network     : %s (%s)\n", jr.NetworkName, jr.NetworkCIDR)
 	fmt.Printf("✓ Member ID   : %s\n", jr.MemberID)
 
-	// Save config — everything the agent needs, no API key
 	cfg := &config.Config{
 		ServerURL:    serverURL,
 		NetworkID:    networkID,
@@ -260,7 +260,6 @@ approved:
 		LogLevel:     "info",
 		WGListenPort: 51820,
 		STUNServer:   "stun.l.google.com:19302",
-		// ZeroTier-style fields
 		MemberID:     jr.MemberID,
 		MemberToken:  jr.MemberToken,
 		WGPrivateKey: privKey,
@@ -270,7 +269,7 @@ approved:
 	if err := config.Save(cfg); err != nil {
 		return fmt.Errorf("join: save config: %w", err)
 	}
-	fmt.Println("✓ Config saved  ~/.quicktunnel/config.json")
+	fmt.Println("✓ Config saved")
 	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)\n")
 
 	return startAgent(cfg)
@@ -434,15 +433,17 @@ func runVNC(args []string) error {
 
 func runLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	email    := fs.String("email", "", "")
+	email := fs.String("email", "", "")
 	password := fs.String("password", "", "")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("login: parse args: %w", err)
+	}
 	if *email == "" || *password == "" {
 		return fmt.Errorf("login: --email and --password required")
 	}
 	cfg, err := config.Load()
 	if err != nil {
-		cfg = &config.Config{ServerURL: "http://localhost:8080"}
+		cfg = &config.Config{ServerURL: "http://localhost:3000"}
 	}
 	c := api_client.NewClient(cfg.ServerURL, "")
 	resp, err := c.Login(*email, *password)
@@ -450,8 +451,10 @@ func runLogin(args []string) error {
 		return fmt.Errorf("login: %w", err)
 	}
 	cfg.APIKey = resp.APIKey
-	cfg.Email  = *email
-	_ = config.Save(cfg)
+	cfg.Email = *email
+	if err := config.Save(cfg); err != nil {
+		return fmt.Errorf("login: save config: %w", err)
+	}
 	fmt.Printf("Logged in as %s\n", resp.User.Email)
 	return nil
 }
@@ -463,22 +466,33 @@ func runConfig(args []string) error {
 	}
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
 	setVal := fs.String("set", "", "key=value")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("config: parse args: %w", err)
+	}
 	if *setVal != "" {
 		parts := strings.SplitN(*setVal, "=", 2)
 		if len(parts) == 2 {
 			k, v := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 			switch k {
-			case "server_url": cfg.ServerURL = v
-			case "api_key":    cfg.APIKey = v
-			case "network_id": cfg.NetworkID = v
-			case "device_name": cfg.DeviceName = v
-			case "log_level":  cfg.LogLevel = v
+			case "server_url":
+				cfg.ServerURL = v
+			case "api_key":
+				cfg.APIKey = v
+			case "network_id":
+				cfg.NetworkID = v
+			case "device_name":
+				cfg.DeviceName = v
+			case "log_level":
+				cfg.LogLevel = v
 			case "wg_listen_port":
-				if n, err := strconv.Atoi(v); err == nil { cfg.WGListenPort = n }
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.WGListenPort = n
+				}
 			}
 		}
-		_ = config.Save(cfg)
+		if err := config.Save(cfg); err != nil {
+			return fmt.Errorf("config: save config: %w", err)
+		}
 	}
 	return printJSON(cfg)
 }
@@ -491,7 +505,7 @@ CONNECT (no binary needed):
 
 CONNECT (if already installed):
   quicktunnel join <server> <network_id>
-  quicktunnel join 54.89.232.16 5agrlxob7exh
+  quicktunnel join vpn.example.com 5agrlxob7exh
 
 COMMANDS:
   join      <server> <network_id>  connect (generates keys, polls for approval)
@@ -507,9 +521,7 @@ COMMANDS:
   network_id = from the dashboard`)
 }
 
-// runInstall registers QuickTunnel as a system service (systemd on Linux, sc.exe on Windows).
 func runInstall(args []string) error {
-	// Verify config exists
 	cfg, err := config.Load()
 	if err != nil || cfg.NetworkID == "" {
 		return fmt.Errorf("install: no config found — run 'quicktunnel join <server> <network_id>' first")
@@ -605,7 +617,6 @@ func uninstallSystemdService() error {
 }
 
 func installWindowsService(exePath string) error {
-	// Create the service using sc.exe
 	createCmdArgs := []string{
 		"create", "QuickTunnel",
 		"binPath=", fmt.Sprintf("\"%s\" up", exePath),
@@ -614,25 +625,18 @@ func installWindowsService(exePath string) error {
 	}
 	out, err := exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
 	if err != nil {
-		// Try stopping and deleting first if it already exists
 		_ = exec.Command("sc.exe", "stop", "QuickTunnel").Run()
 		_ = exec.Command("sc.exe", "delete", "QuickTunnel").Run()
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 		out, err = exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("install: sc create: %w\n%s\n  Try running as Administrator", err, string(out))
 		}
 	}
 
-	// Set description
-	_ = exec.Command("sc.exe", "description", "QuickTunnel",
-		"QuickTunnel ZeroTier-style mesh VPN agent").Run()
+	_ = exec.Command("sc.exe", "description", "QuickTunnel", "QuickTunnel ZeroTier-style mesh VPN agent").Run()
+	_ = exec.Command("sc.exe", "failure", "QuickTunnel", "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
 
-	// Set recovery to auto-restart on failure
-	_ = exec.Command("sc.exe", "failure", "QuickTunnel",
-		"reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
-
-	// Start the service
 	if startOut, err := exec.Command("sc.exe", "start", "QuickTunnel").CombinedOutput(); err != nil {
 		fmt.Printf("[WARN] Service created but failed to start: %s\n", string(startOut))
 	}
@@ -670,28 +674,18 @@ func printJSON(v any) error {
 	return nil
 }
 
-func pidFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".quicktunnel", "quicktunnel.pid"), nil
+func pidFilePath() string {
+	return filepath.Join(os.TempDir(), "quicktunnel.pid")
 }
 
 func writePIDFile(pid int) error {
-	path, err := pidFilePath()
-	if err != nil {
-		return err
-	}
+	path := pidFilePath()
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	return os.WriteFile(path, []byte(fmt.Sprintf("%d", pid)), 0o644)
 }
 
 func readPIDFile() (int, error) {
-	path, err := pidFilePath()
-	if err != nil {
-		return 0, err
-	}
+	path := pidFilePath()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
@@ -700,9 +694,7 @@ func readPIDFile() (int, error) {
 }
 
 func removePIDFile() {
-	if path, err := pidFilePath(); err == nil {
-		_ = os.Remove(path)
-	}
+	_ = os.Remove(pidFilePath())
 }
 
 func init() { time.Local = time.UTC }

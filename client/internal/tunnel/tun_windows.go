@@ -98,7 +98,7 @@ func ConfigureTUN(name string, ip string, cidr string) error {
 		return fmt.Errorf("configure tun: derive mask: %w", err)
 	}
 
-	if err := runNetsh("interface", "ip", "set", "address", "name="+name, "source=static", "addr="+ip, "mask="+mask); err != nil {
+	if err := runNetsh("interface", "ip", "set", "address", name, "static", ip, mask); err != nil {
 		return fmt.Errorf("configure tun: set ipv4 address: %w", err)
 	}
 	return nil

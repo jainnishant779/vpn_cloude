@@ -40,6 +40,7 @@ type WGTunnel struct {
 	device  TUNDevice
 	peers   map[string]*PeerConfig
 	stats   TunnelStats
+	wgPath  string
 }
 
 func networkAddr(ip string, maskBits int) string {
@@ -102,8 +103,9 @@ func (w *WGTunnel) Start() error {
 	w.deviceName = device.Name()
 
 	// Real WireGuard kernel setup (platform-specific)
-	if checkWGAvailable() {
-		ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort)
+	if path, err := exec.LookPath("wg"); err == nil {
+		w.wgPath = path
+		ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort, w.wgPath)
 		if err != nil {
 			fmt.Printf("[WARN] wg set interface failed: %v\n", err)
 		} else if ready {
@@ -114,7 +116,7 @@ func (w *WGTunnel) Start() error {
 		fmt.Println("[WARN] wireguard-tools not installed — raw TUN mode (ICMP only)")
 	}
 
-	enableIPForwarding()
+	enableIPForwarding(w.deviceName)
 	maskBits, _ := maskBitsFromCIDR(w.cidr)
 	subnetCIDR := fmt.Sprintf("%s/%d", networkAddr(w.virtualIP, maskBits), maskBits)
 	_ = addSubnetRoute(subnetCIDR, w.deviceName)
@@ -155,7 +157,7 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 	w.stats.LastHandshake = now
 
 	if w.wgReady {
-		_ = addWGPeer(w.deviceName, publicKey, endpoint, allowedIP)
+		_ = addWGPeer(w.deviceName, publicKey, endpoint, allowedIP, w.wgPath)
 	}
 
 	peerIP := strings.Split(allowedIP, "/")[0]
@@ -179,7 +181,7 @@ func (w *WGTunnel) RemovePeer(publicKey string) error {
 	}
 
 	if w.wgReady {
-		_ = removeWGPeer(w.deviceName, publicKey)
+		_ = removeWGPeer(w.deviceName, publicKey, w.wgPath)
 	}
 
 	peerIP := strings.Split(peer.AllowedIP, "/")[0]
@@ -204,7 +206,7 @@ func (w *WGTunnel) UpdatePeerEndpoint(publicKey, newEndpoint string) error {
 	w.stats.LastHandshake = peer.LastHandshake
 
 	if w.wgReady {
-		_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint)
+		_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint, w.wgPath)
 	}
 	return nil
 }
@@ -213,6 +215,12 @@ func (w *WGTunnel) GetStats() TunnelStats {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.stats
+}
+
+func (w *WGTunnel) CIDR() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.cidr
 }
 
 func (w *WGTunnel) RecordRX(bytes uint64) {
@@ -236,7 +244,7 @@ func (w *WGTunnel) Stop() error {
 
 	for pubKey, peer := range w.peers {
 		if w.wgReady {
-			_ = removeWGPeer(w.deviceName, pubKey)
+			_ = removeWGPeer(w.deviceName, pubKey, w.wgPath)
 		}
 		peerIP := strings.Split(peer.AllowedIP, "/")[0]
 		_ = removeHostRoute(peerIP, w.deviceName)

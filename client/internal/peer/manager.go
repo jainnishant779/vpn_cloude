@@ -139,7 +139,7 @@ func (m *PeerManager) syncPeersOnce() error {
 		}
 
 		// Update endpoint if changed
-		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints)
+		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints, m.tunnel.CIDR())
 		if newEndpoint != "" && newEndpoint != existing.Endpoint {
 			_ = m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint)
 			m.mu.Lock()
@@ -175,9 +175,11 @@ func (m *PeerManager) syncPeersOnce() error {
 }
 
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
-func preferIPv4(publicEndpoint string, localEndpoints []string) string {
+func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
 	// 1. Check if any local endpoint is on the same subnet as us (same LAN)
 	addrs, _ := net.InterfaceAddrs()
+	_, tunNet, _ := net.ParseCIDR(tunCIDR)
+
 	for _, ep := range localEndpoints {
 		peerHost, _, err := net.SplitHostPort(ep)
 		if err != nil {
@@ -185,6 +187,11 @@ func preferIPv4(publicEndpoint string, localEndpoints []string) string {
 		}
 		peerIP := net.ParseIP(peerHost)
 		if peerIP == nil || peerIP.To4() == nil {
+			continue
+		}
+		
+		// Avoid routing loop by ignoring peers claiming IP addresses in the tunnel virtual subnet
+		if tunNet != nil && tunNet.Contains(peerIP) {
 			continue
 		}
 		
@@ -254,7 +261,7 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 	}
 
 	// Get best endpoint — prefer IPv4
-	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints)
+	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints, m.tunnel.CIDR())
 	connectedVia := "direct"
 
 	// If no endpoint at all, try relay
@@ -366,7 +373,7 @@ func (m *PeerManager) AttemptDirect(peerID string) error {
 	if target == nil {
 		return fmt.Errorf("attempt direct: peer not found")
 	}
-	endpoint := preferIPv4(target.PublicEndpoint, target.LocalEndpoints)
+	endpoint := preferIPv4(target.PublicEndpoint, target.LocalEndpoints, m.tunnel.CIDR())
 	if endpoint == "" {
 		return fmt.Errorf("attempt direct: peer has no direct endpoint")
 	}

@@ -37,8 +37,11 @@ func runWGCmd(description, command string) error {
 	return nil
 }
 
-func configureWG(deviceName, privateKey string, listenPort int) (bool, error) {
-	cmd := exec.Command("wg", "set", deviceName,
+func configureWG(deviceName, privateKey string, listenPort int, wgPath string) (bool, error) {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	cmd := exec.Command(wgPath, "set", deviceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
 		"private-key", "/dev/stdin")
 	cmd.Stdin = strings.NewReader(privateKey)
@@ -49,20 +52,29 @@ func configureWG(deviceName, privateKey string, listenPort int) (bool, error) {
 	return true, nil
 }
 
-func addWGPeer(deviceName, publicKey, endpoint, allowedIP string) error {
+func addWGPeer(deviceName, publicKey, endpoint, allowedIP string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
 	cmd := fmt.Sprintf(
-		"wg set %s peer %s endpoint %s allowed-ips %s persistent-keepalive 25",
-		deviceName, publicKey, endpoint, allowedIP,
+		"%s set %s peer %s endpoint %s allowed-ips %s persistent-keepalive 25",
+		wgPath, deviceName, publicKey, endpoint, allowedIP,
 	)
 	return runWGCmd("add wg peer", cmd)
 }
 
-func removeWGPeer(deviceName, publicKey string) error {
-	cmd := fmt.Sprintf("wg set %s peer %s remove", deviceName, publicKey)
+func removeWGPeer(deviceName, publicKey string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	cmd := fmt.Sprintf("%s set %s peer %s remove", wgPath, deviceName, publicKey)
 	return runWGCmd("remove wg peer", cmd)
 }
 
-func updateWGPeerEndpoint(deviceName, publicKey, endpoint string) error {
-	cmd := fmt.Sprintf("wg set %s peer %s endpoint %s", deviceName, publicKey, endpoint)
+func updateWGPeerEndpoint(deviceName, publicKey, endpoint string, wgPath string) error {
+	if wgPath == "" {
+		wgPath = "wg"
+	}
+	cmd := fmt.Sprintf("%s set %s peer %s endpoint %s", wgPath, deviceName, publicKey, endpoint)
 	return runWGCmd("update peer endpoint", cmd)
 }
