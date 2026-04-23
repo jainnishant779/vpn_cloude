@@ -280,11 +280,11 @@ SET public_endpoint = $2,
     rx_bytes = $5,
     tx_bytes = $6,
     relay_id = NULLIF($7, ''),
-    is_online = CASE WHEN $2 = '' THEN false ELSE true END,
+    is_online = true,
     last_seen = NOW()
 WHERE id = $1;`
 
-	result, err := s.db.Pool.Exec(
+	_, err := s.db.Pool.Exec(
 		ctx,
 		query,
 		peerID,
@@ -297,9 +297,6 @@ WHERE id = $1;`
 	)
 	if err != nil {
 		return fmt.Errorf("update peer status: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("update peer status: %w", ErrNotFound)
 	}
 	return nil
 }
