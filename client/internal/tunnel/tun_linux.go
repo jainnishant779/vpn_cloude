@@ -41,6 +41,8 @@ func resolveWireGuardGo() string {
 		"/usr/local/bin/wireguard-go",
 		"/usr/sbin/wireguard-go",
 		"/snap/bin/wireguard-go",
+		"/usr/bin/wireguard",        // Ubuntu 22.04 wireguard-go package installs it here
+		"/usr/local/bin/wireguard",
 		"/usr/bin/boringtun",
 		"/usr/local/bin/boringtun",
 		"/usr/bin/boringtun-cli",
@@ -52,7 +54,7 @@ func resolveWireGuardGo() string {
 		}
 	}
 	// Try PATH-based lookup as fallback
-	for _, name := range []string{"wireguard-go", "boringtun", "boringtun-cli"} {
+	for _, name := range []string{"wireguard-go", "wireguard", "boringtun", "boringtun-cli"} {
 		if p, err := exec.LookPath(name); err == nil {
 			return p
 		}
@@ -66,9 +68,12 @@ func tryInstallWireGuardGo() string {
 	if _, err := exec.LookPath("apt-get"); err == nil {
 		_ = exec.Command("apt-get", "update", "-qq").Run()
 		_ = exec.Command("apt-get", "install", "-y", "-qq", "wireguard-go").Run()
-		// Check the known path immediately
+		// Check the known paths immediately
 		if info, err := os.Stat("/usr/bin/wireguard-go"); err == nil && !info.IsDir() {
 			return "/usr/bin/wireguard-go"
+		}
+		if info, err := os.Stat("/usr/bin/wireguard"); err == nil && !info.IsDir() {
+			return "/usr/bin/wireguard"
 		}
 	}
 	// Try go install if go is available
@@ -112,7 +117,9 @@ func (d *LinuxWGDevice) Create(name string, mtu int) error {
 	if wgGoPath == "" {
 		return fmt.Errorf("create wireguard device: WireGuard kernel module unavailable and wireguard-go not found.\n" +
 			"  Fix: sudo apt install wireguard-go\n" +
-			"  Or:  download Go 1.22+ and run: sudo GOBIN=/usr/local/bin go install golang.zx2c4.com/wireguard-go@latest")
+			"  Or build from source:\n" +
+			"    git clone https://git.zx2c4.com/wireguard-go\n" +
+			"    cd wireguard-go && make && sudo cp wireguard-go /usr/local/bin/")
 	}
 
 	// Start wireguard-go — it creates its own TUN interface
