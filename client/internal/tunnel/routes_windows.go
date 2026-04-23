@@ -15,13 +15,9 @@ func enableIPForwarding() {
 }
 
 func addSubnetRoute(networkCIDR, deviceName string) error {
-	parts := strings.SplitN(networkCIDR, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid cidr: %s", networkCIDR)
-	}
-	out, err := exec.Command("route", "add", parts[0], "mask",
-		cidrToMask(parts[1]), "0.0.0.0", "if", deviceName).CombinedOutput()
-	if err != nil {
+	out, err := exec.Command("netsh", "interface", "ipv4", "add", "route",
+		networkCIDR, deviceName, "store=active").CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "exists") && !strings.Contains(string(out), "already") {
 		fmt.Printf("[WARN] add subnet route failed: %s — %v\n", strings.TrimSpace(string(out)), err)
 		return err
 	}
@@ -29,9 +25,9 @@ func addSubnetRoute(networkCIDR, deviceName string) error {
 }
 
 func addHostRoute(peerIP, deviceName string) error {
-	out, err := exec.Command("route", "add", peerIP, "mask",
-		"255.255.255.255", "0.0.0.0", "if", deviceName).CombinedOutput()
-	if err != nil {
+	out, err := exec.Command("netsh", "interface", "ipv4", "add", "route",
+		peerIP+"/32", deviceName, "store=active").CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "exists") && !strings.Contains(string(out), "already") {
 		fmt.Printf("[WARN] add peer route failed: %s — %v\n", strings.TrimSpace(string(out)), err)
 		return err
 	}
@@ -39,8 +35,9 @@ func addHostRoute(peerIP, deviceName string) error {
 }
 
 func removeHostRoute(peerIP, deviceName string) error {
-	out, err := exec.Command("route", "delete", peerIP).CombinedOutput()
-	if err != nil {
+	out, err := exec.Command("netsh", "interface", "ipv4", "delete", "route",
+		peerIP+"/32", deviceName).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "not found") {
 		fmt.Printf("[WARN] remove peer route failed: %s — %v\n", strings.TrimSpace(string(out)), err)
 		return err
 	}
@@ -104,10 +101,3 @@ func updateWGPeerEndpoint(deviceName, publicKey, endpoint string) error {
 	return nil
 }
 
-func cidrToMask(bits string) string {
-	var b int
-	fmt.Sscanf(bits, "%d", &b)
-	mask := uint32(0xFFFFFFFF) << (32 - b)
-	return fmt.Sprintf("%d.%d.%d.%d",
-		(mask>>24)&0xFF, (mask>>16)&0xFF, (mask>>8)&0xFF, mask&0xFF)
-}
