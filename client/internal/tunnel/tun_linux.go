@@ -17,15 +17,16 @@ type LinuxWGDevice struct {
 func (d *LinuxWGDevice) Configure(ip string, cidr string) error {
 	maskBits, err := maskBitsFromCIDR(cidr)
 	if err != nil {
-		return fmt.Errorf("configure: parse cidr: %w", err)
+		return fmt.Errorf("configure: %w", err)
 	}
 	addr := fmt.Sprintf("%s/%d", ip, maskBits)
 	out, err := exec.Command("ip", "addr", "add", addr, "dev", d.name).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "exists") {
 		return fmt.Errorf("configure: assign ip: %w: %s", err, string(out))
 	}
-	if out, err := exec.Command("ip", "link", "set", d.name, "up").CombinedOutput(); err != nil {
-		return fmt.Errorf("configure: bring up: %w: %s", err, string(out))
+	out2, err2 := exec.Command("ip", "link", "set", d.name, "up").CombinedOutput()
+	if err2 != nil {
+		return fmt.Errorf("configure: bring up: %w: %s", err2, string(out2))
 	}
 	return nil
 }
@@ -39,10 +40,7 @@ func (d *LinuxWGDevice) Close() error {
 }
 
 func CreateTUN(name string, mtu int) (TUNDevice, error) {
-	// Delete old interface if exists
 	_ = exec.Command("ip", "link", "delete", name).Run()
-
-	// Create real WireGuard interface
 	out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("linux tun create: create interface: %w: %s", err, strings.TrimSpace(string(out)))
@@ -54,8 +52,7 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 }
 
 func ConfigureTUN(name string, ip string, cidr string) error {
-	d := &LinuxWGDevice{name: name}
-	return d.Configure(ip, cidr)
+	return (&LinuxWGDevice{name: name}).Configure(ip, cidr)
 }
 
 func SetMTU(name string, mtu int) error {
