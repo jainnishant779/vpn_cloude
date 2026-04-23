@@ -229,6 +229,9 @@ func (a *Agent) Start() error {
 	// ── Peer manager ──────────────────────────────────────────────────────────
 	a.state.Set(StateConnecting)
 	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, peerID)
+	if useMemberToken {
+		a.peerMgr.SetMemberID(peerID)
+	}
 	a.peerMgr.Start()
 	a.startPacketForwarding()
 
