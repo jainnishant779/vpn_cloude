@@ -160,3 +160,42 @@ func (h *MemberTunnelHandler) Announce(w http.ResponseWriter, r *http.Request) {
 	}
 	writeSuccess(w, http.StatusOK, map[string]string{"status": "announced"})
 }
+
+// Offline — POST /api/v1/members/{mid}/offline
+// Called by the client agent on graceful shutdown to immediately remove peer.
+func (h *MemberTunnelHandler) Offline(w http.ResponseWriter, r *http.Request) {
+	peer := h.authMember(w, r)
+	if peer == nil {
+		return
+	}
+
+	// Mark peer offline in database
+	if err := h.peers.UpdatePeerStatus(r.Context(), peer.ID, queries.PeerStatusUpdate{
+		PublicEndpoint: "",
+		LocalEndpoints: []string{},
+	}); err != nil {
+		log.Warn().Err(err).Str("peer_id", peer.ID).Msg("offline: update status failed")
+	}
+
+	// Also mark is_online = false explicitly
+	if marker, ok := h.peers.(interface {
+		MarkPeerOffline(ctx context.Context, peerID string) error
+	}); ok {
+		_ = marker.MarkPeerOffline(r.Context(), peer.ID)
+	}
+
+	// Clean up Redis coordination entry
+	if h.redis != nil {
+		entryKey := fmt.Sprintf("coord:announce:%s:%s", peer.NetworkID, peer.ID)
+		indexKey := fmt.Sprintf("coord:network:%s:peers", peer.NetworkID)
+		pipe := h.redis.TxPipeline()
+		pipe.Del(r.Context(), entryKey)
+		pipe.SRem(r.Context(), indexKey, peer.ID)
+		if _, err := pipe.Exec(r.Context()); err != nil {
+			log.Warn().Err(err).Str("peer_id", peer.ID).Msg("offline: redis cleanup failed")
+		}
+	}
+
+	log.Info().Str("peer_id", peer.ID).Str("name", peer.Name).Msg("peer went offline gracefully")
+	writeSuccess(w, http.StatusOK, map[string]string{"status": "offline"})
+}

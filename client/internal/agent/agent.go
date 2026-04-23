@@ -253,6 +253,9 @@ func (a *Agent) Stop() error {
 	a.cancel()
 	a.wg.Wait()
 
+	// Signal server that we're going offline (best-effort)
+	a.signalOffline()
+
 	var firstErr error
 	if a.peerMgr != nil {
 		if err := a.peerMgr.Stop(); err != nil && firstErr == nil {
@@ -271,6 +274,28 @@ func (a *Agent) Stop() error {
 	}
 	a.state.Set(StateStopped)
 	return firstErr
+}
+
+// signalOffline tells the server this peer is going offline.
+func (a *Agent) signalOffline() {
+	if a.apiClient == nil {
+		return
+	}
+	a.mu.RLock()
+	memberID := a.memberID
+	peerID := a.peerID
+	a.mu.RUnlock()
+
+	if memberID != "" {
+		if err := a.apiClient.MemberGoOffline(memberID); err != nil {
+			log.Warn().Err(err).Msg("agent stop: failed to signal offline (non-fatal)")
+		}
+	} else if peerID != "" {
+		// For classic mode, send a heartbeat with empty endpoint to signal offline
+		_ = a.apiClient.Heartbeat(a.config.NetworkID, peerID, api_client.PeerStatus{
+			PublicEndpoint: "",
+		})
+	}
 }
 
 func (a *Agent) heartbeatLoop(useMemberToken bool) {

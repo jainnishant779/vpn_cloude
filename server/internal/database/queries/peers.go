@@ -189,15 +189,6 @@ func (s *PeerStore) GetPeerByPublicKey(ctx context.Context, networkID, publicKey
 
 func (s *PeerStore) ListNetworkPeers(ctx context.Context, networkID string) ([]models.Peer, error) {
 	query := `
-SELECT p.` + strings.ReplaceAll(peerColumns, ", ", ", p.") + `
-FROM peers p
-JOIN networks n ON n.id = p.network_id
-WHERE n.is_active = true
-	AND (n.id::text = $1 OR n.network_id = $1)
-ORDER BY p.created_at ASC;`
-
-	// Simpler query that works without the column prefix gymnastics
-	query = `
 SELECT ` + peerColumns + `
 FROM peers
 WHERE network_id IN (SELECT id FROM networks WHERE is_active = true AND (id::text = $1 OR network_id = $1))
@@ -289,7 +280,7 @@ SET public_endpoint = $2,
     rx_bytes = $5,
     tx_bytes = $6,
     relay_id = NULLIF($7, ''),
-    is_online = true,
+    is_online = CASE WHEN $2 = '' THEN false ELSE true END,
     last_seen = NOW()
 WHERE id = $1;`
 

@@ -150,6 +150,7 @@ func SetupRouter(db *database.DB, redisClient *redis.Client, authService *auth.J
 			memberTunnel.Put("/members/{mid}/heartbeat", memberTunnelHandler.Heartbeat)
 			memberTunnel.Get("/members/{mid}/peers", memberTunnelHandler.Peers)
 			memberTunnel.Post("/members/{mid}/announce", memberTunnelHandler.Announce)
+			memberTunnel.Post("/members/{mid}/offline", memberTunnelHandler.Offline)
 		})
 
 		// ── Auth ──────────────────────────────────────────────────────────

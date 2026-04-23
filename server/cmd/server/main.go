@@ -114,6 +114,26 @@ func main() {
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// ── Stale peer cleanup loop ───────────────────────────────────────────
+	// Auto-expire peers that haven't sent a heartbeat in 90 seconds.
+	// This implements the "auto-remove IP when disconnected" feature.
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				const expireQuery = `UPDATE peers SET is_online = false WHERE is_online = true AND last_seen < NOW() - interval '90 seconds';`
+				if _, err := db.Pool.Exec(context.Background(), expireQuery); err != nil {
+					log.Warn().Err(err).Msg("stale peer cleanup failed")
+				}
+			case <-cleanupCtx.Done():
+				return
+			}
+		}
+	}()
+
 	select {
 	case sig := <-signalCh:
 		log.Info().Str("signal", sig.String()).Msg("shutdown signal received")
@@ -122,6 +142,8 @@ func main() {
 			log.Fatal().Err(err).Msg("server stopped unexpectedly")
 		}
 	}
+
+	cleanupCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -55,6 +56,10 @@ func main() {
 		err = runLogin(args)
 	case "config":
 		err = runConfig(args)
+	case "install":
+		err = runInstall(args)
+	case "uninstall":
+		err = runUninstall(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -489,15 +494,165 @@ CONNECT (if already installed):
   quicktunnel join 54.89.232.16 5agrlxob7exh
 
 COMMANDS:
-  join   <server> <network_id>  connect (generates keys, polls for approval)
-  leave                         disconnect
-  up                            reconnect using saved config
-  status                        show connection info
-  peers                         list network peers
-  vnc    <peer-name>            open VNC to a peer
+  join      <server> <network_id>  connect (generates keys, polls for approval)
+  leave                            disconnect
+  up                               reconnect using saved config
+  status                           show connection info
+  peers                            list network peers
+  vnc       <peer-name>            open VNC to a peer
+  install                          install as system startup service
+  uninstall                        remove system startup service
 
   server     = EC2 IP (default port 3000) or full URL
   network_id = from the dashboard`)
+}
+
+// runInstall registers QuickTunnel as a system service (systemd on Linux, sc.exe on Windows).
+func runInstall(args []string) error {
+	// Verify config exists
+	cfg, err := config.Load()
+	if err != nil || cfg.NetworkID == "" {
+		return fmt.Errorf("install: no config found — run 'quicktunnel join <server> <network_id>' first")
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("install: cannot determine executable path: %w", err)
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		return installSystemdService(exePath)
+	case "windows":
+		return installWindowsService(exePath)
+	default:
+		return fmt.Errorf("install: unsupported OS %s (supported: linux, windows)", runtime.GOOS)
+	}
+}
+
+func runUninstall(args []string) error {
+	switch runtime.GOOS {
+	case "linux":
+		return uninstallSystemdService()
+	case "windows":
+		return uninstallWindowsService()
+	default:
+		return fmt.Errorf("uninstall: unsupported OS %s", runtime.GOOS)
+	}
+}
+
+func installSystemdService(exePath string) error {
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=QuickTunnel VPN Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s up
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+Environment=LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target
+`, exePath)
+
+	servicePath := "/etc/systemd/system/quicktunnel.service"
+	if err := os.WriteFile(servicePath, []byte(serviceContent), 0o644); err != nil {
+		return fmt.Errorf("install: write service file: %w\n  Try running with sudo", err)
+	}
+
+	cmds := []struct {
+		name string
+		args []string
+	}{
+		{"systemctl", []string{"daemon-reload"}},
+		{"systemctl", []string{"enable", "quicktunnel"}},
+		{"systemctl", []string{"start", "quicktunnel"}},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command(c.name, c.args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("install: %s %v: %w\n%s", c.name, c.args, err, string(out))
+		}
+	}
+
+	fmt.Println("✓ QuickTunnel installed as systemd service")
+	fmt.Println("  Service name : quicktunnel")
+	fmt.Println("  Auto-start   : enabled")
+	fmt.Println("  Check status : sudo systemctl status quicktunnel")
+	fmt.Println("  View logs    : sudo journalctl -u quicktunnel -f")
+	return nil
+}
+
+func uninstallSystemdService() error {
+	cmds := []struct {
+		name string
+		args []string
+	}{
+		{"systemctl", []string{"stop", "quicktunnel"}},
+		{"systemctl", []string{"disable", "quicktunnel"}},
+	}
+	for _, c := range cmds {
+		_ = exec.Command(c.name, c.args...).Run()
+	}
+	_ = os.Remove("/etc/systemd/system/quicktunnel.service")
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	fmt.Println("✓ QuickTunnel service removed")
+	return nil
+}
+
+func installWindowsService(exePath string) error {
+	// Create the service using sc.exe
+	createCmdArgs := []string{
+		"create", "QuickTunnel",
+		"binPath=", fmt.Sprintf("\"%s\" up", exePath),
+		"start=", "auto",
+		"DisplayName=", "QuickTunnel VPN Agent",
+	}
+	out, err := exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
+	if err != nil {
+		// Try stopping and deleting first if it already exists
+		_ = exec.Command("sc.exe", "stop", "QuickTunnel").Run()
+		_ = exec.Command("sc.exe", "delete", "QuickTunnel").Run()
+		time.Sleep(1 * time.Second)
+		out, err = exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("install: sc create: %w\n%s\n  Try running as Administrator", err, string(out))
+		}
+	}
+
+	// Set description
+	_ = exec.Command("sc.exe", "description", "QuickTunnel",
+		"QuickTunnel ZeroTier-style mesh VPN agent").Run()
+
+	// Set recovery to auto-restart on failure
+	_ = exec.Command("sc.exe", "failure", "QuickTunnel",
+		"reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
+
+	// Start the service
+	if startOut, err := exec.Command("sc.exe", "start", "QuickTunnel").CombinedOutput(); err != nil {
+		fmt.Printf("[WARN] Service created but failed to start: %s\n", string(startOut))
+	}
+
+	fmt.Println("✓ QuickTunnel installed as Windows Service")
+	fmt.Println("  Service name : QuickTunnel")
+	fmt.Println("  Auto-start   : enabled")
+	fmt.Println("  Check status : sc query QuickTunnel")
+	return nil
+}
+
+func uninstallWindowsService() error {
+	_ = exec.Command("sc.exe", "stop", "QuickTunnel").Run()
+	time.Sleep(2 * time.Second)
+	out, err := exec.Command("sc.exe", "delete", "QuickTunnel").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("uninstall: sc delete: %w\n%s\n  Try running as Administrator", err, string(out))
+	}
+	fmt.Println("✓ QuickTunnel service removed")
+	return nil
 }
 
 func configureLogging(levelRaw string) {

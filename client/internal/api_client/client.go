@@ -432,3 +432,12 @@ func (c *Client) MemberAnnounce(memberID string, req MemberAnnounceRequest) erro
 	}
 	return nil
 }
+
+// MemberGoOffline signals the server that this member is disconnecting.
+func (c *Client) MemberGoOffline(memberID string) error {
+	path := fmt.Sprintf("/api/v1/members/%s/offline", url.PathEscape(memberID))
+	if err := c.doJSON(context.Background(), http.MethodPost, path, nil, authMemberToken, nil); err != nil {
+		return fmt.Errorf("member go offline: %w", err)
+	}
+	return nil
+}

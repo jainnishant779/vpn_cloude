@@ -174,23 +174,53 @@ func (m *PeerManager) syncPeersOnce() error {
 	return nil
 }
 
-// preferIPv4 returns IPv4 endpoint if available, otherwise returns original.
+// preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string) string {
-	// Public IPv4 (not starting with [)
+	// Check if public endpoint is IPv4 (not bracketed IPv6)
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
-		return publicEndpoint
+		// Also verify it's actually IPv4 and has a port
+		host, _, err := net.SplitHostPort(publicEndpoint)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+				return publicEndpoint
+			}
+		}
+		// Bare IPv4 without port
+		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
+			return publicEndpoint + ":51820"
+		}
 	}
-	// Try local endpoints for IPv4
+
+	// Try local endpoints for IPv4 (great for same-LAN VNC)
 	for _, ep := range localEndpoints {
-		if !strings.HasPrefix(ep, "[") && strings.Contains(ep, ".") {
+		if strings.HasPrefix(ep, "[") {
+			continue // skip IPv6
+		}
+		if !strings.Contains(ep, ".") {
+			continue // not IPv4
+		}
+		// Skip link-local (169.254.x.x)
+		ipStr := ep
+		if strings.Contains(ipStr, ":") {
+			h, _, err := net.SplitHostPort(ipStr)
+			if err != nil {
+				continue
+			}
+			ipStr = h
+		}
+		if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil {
+			if strings.HasPrefix(ipStr, "169.254.") {
+				continue
+			}
 			if !strings.Contains(ep, ":") {
 				return ep + ":51820"
 			}
 			return ep
 		}
 	}
-	// Fall back to IPv6 public endpoint
-	return publicEndpoint
+
+	// Do NOT fall back to IPv6 — return empty so relay fallback kicks in
+	return ""
 }
 
 func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
