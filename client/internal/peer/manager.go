@@ -174,194 +174,89 @@ func (m *PeerManager) syncPeersOnce() error {
 	return nil
 }
 
-// preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
+// preferIPv4 selects the best endpoint for a peer.
+// Priority:
+//  1. Local LAN IP (same /24 subnet) — avoids NAT hairpin issues
+//  2. Private RFC1918 IP (same router, different subnet)
+//  3. Public IPv4 endpoint
 func preferIPv4(publicEndpoint string, localEndpoints []string) string {
-	// Check if public endpoint is IPv4 (not bracketed IPv6)
+	myAddrs, _ := net.InterfaceAddrs()
+
+	// ── Priority 1: Same LAN (same /24) ──────────────────────────────────────
+	for _, ep := range localEndpoints {
+		peerHost, peerPort, err := net.SplitHostPort(ep)
+		if err != nil {
+			peerHost = ep
+			peerPort = "51820"
+		}
+		peerIP := net.ParseIP(peerHost)
+		if peerIP == nil || peerIP.To4() == nil {
+			continue
+		}
+		if strings.HasPrefix(peerHost, "169.254.") || peerHost == "127.0.0.1" {
+			continue
+		}
+		for _, addr := range myAddrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
+				continue
+			}
+			// Exact subnet match
+			if ipnet.Contains(peerIP) {
+				if peerPort == "" {
+					peerPort = "51820"
+				}
+				return net.JoinHostPort(peerHost, peerPort)
+			}
+		}
+	}
+
+	// ── Priority 2: Any private RFC1918 local endpoint ───────────────────────
+	for _, ep := range localEndpoints {
+		peerHost, peerPort, err := net.SplitHostPort(ep)
+		if err != nil {
+			peerHost = ep
+			peerPort = "51820"
+		}
+		peerIP := net.ParseIP(peerHost)
+		if peerIP == nil || peerIP.To4() == nil {
+			continue
+		}
+		if isPrivateIP(peerIP) && !strings.HasPrefix(peerHost, "169.254.") {
+			if peerPort == "" {
+				peerPort = "51820"
+			}
+			return net.JoinHostPort(peerHost, peerPort)
+		}
+	}
+
+	// ── Priority 3: Public IPv4 endpoint ────────────────────────────────────
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
-		// Also verify it's actually IPv4 and has a port
-		host, _, err := net.SplitHostPort(publicEndpoint)
+		host, port, err := net.SplitHostPort(publicEndpoint)
 		if err == nil {
 			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-				return publicEndpoint
+				// Always use port 51820 for WireGuard
+				_ = port
+				return net.JoinHostPort(host, "51820")
 			}
-		}
-		// Bare IPv4 without port
-		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
-			return publicEndpoint + ":51820"
 		}
 	}
 
-	// Try local endpoints for IPv4 (great for same-LAN VNC)
-	for _, ep := range localEndpoints {
-		if strings.HasPrefix(ep, "[") {
-			continue // skip IPv6
-		}
-		if !strings.Contains(ep, ".") {
-			continue // not IPv4
-		}
-		// Skip link-local (169.254.x.x)
-		ipStr := ep
-		if strings.Contains(ipStr, ":") {
-			h, _, err := net.SplitHostPort(ipStr)
-			if err != nil {
-				continue
-			}
-			ipStr = h
-		}
-		if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil {
-			if strings.HasPrefix(ipStr, "169.254.") {
-				continue
-			}
-			if !strings.Contains(ep, ":") {
-				return ep + ":51820"
-			}
-			return ep
-		}
-	}
-
-	// Do NOT fall back to IPv6 — return empty so relay fallback kicks in
 	return ""
 }
 
-func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
-	if m.tunnel == nil {
-		return fmt.Errorf("connect to peer: tunnel is nil")
-	}
-
-	// Get best endpoint — prefer IPv4
-	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints)
-	connectedVia := "direct"
-
-	// If no endpoint at all, try relay
-	if endpoint == "" {
-		if m.apiClient != nil {
-			relayInfo, err := m.apiClient.GetNearestRelay(peer.ID)
-			if err == nil {
-				endpoint = net.JoinHostPort(relayInfo.RelayHost, strconv.Itoa(relayInfo.RelayPort))
-				connectedVia = "relay"
-			}
+// isPrivateIP returns true for RFC1918 private addresses.
+func isPrivateIP(ip net.IP) bool {
+	private := []string{"10.", "192.168.", "172.16.", "172.17.", "172.18.",
+		"172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+		"172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31."}
+	s := ip.String()
+	for _, p := range private {
+		if strings.HasPrefix(s, p) {
+			return true
 		}
 	}
-
-	// Still no endpoint — skip for now, will retry on next sync
-	if endpoint == "" {
-		return fmt.Errorf("connect to peer: no endpoint available for %s", peer.Name)
-	}
-
-	allowedIP := strings.TrimSpace(peer.VirtualIP)
-	if allowedIP == "" {
-		return fmt.Errorf("connect to peer: peer virtual ip is required")
-	}
-	if !strings.Contains(allowedIP, "/") {
-		allowedIP += "/32"
-	}
-
-	if err := m.tunnel.AddPeer(peer.PublicKey, endpoint, allowedIP); err != nil {
-		return fmt.Errorf("connect to peer: add tunnel peer: %w", err)
-	}
-
-	m.mu.Lock()
-	m.peers[peer.ID] = &PeerConnection{
-		PeerID:       peer.ID,
-		PeerName:     peer.Name,
-		PublicKey:    peer.PublicKey,
-		VirtualIP:    peer.VirtualIP,
-		Endpoint:     endpoint,
-		ConnectedVia: connectedVia,
-		LastSeen:     time.Now().UTC(),
-	}
-	m.mu.Unlock()
-
-	return nil
-}
-
-func (m *PeerManager) disconnectPeer(peerID string) error {
-	m.mu.RLock()
-	conn, exists := m.peers[peerID]
-	m.mu.RUnlock()
-	if !exists {
-		return nil
-	}
-	if conn.PublicKey != "" {
-		_ = m.tunnel.RemovePeer(conn.PublicKey)
-	}
-	m.mu.Lock()
-	delete(m.peers, peerID)
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *PeerManager) ListConnections() []PeerConnection {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make([]PeerConnection, 0, len(m.peers))
-	for _, conn := range m.peers {
-		result = append(result, *conn)
-	}
-	return result
-}
-
-func (m *PeerManager) ForceRelay(peerID string) error {
-	m.mu.RLock()
-	conn, exists := m.peers[peerID]
-	m.mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("force relay: peer not connected")
-	}
-	relayInfo, err := m.apiClient.GetNearestRelay(peerID)
-	if err != nil {
-		return fmt.Errorf("force relay: assign relay: %w", err)
-	}
-	endpoint := net.JoinHostPort(relayInfo.RelayHost, strconv.Itoa(relayInfo.RelayPort))
-	if err := m.tunnel.UpdatePeerEndpoint(conn.PublicKey, endpoint); err != nil {
-		return fmt.Errorf("force relay: update tunnel endpoint: %w", err)
-	}
-	m.mu.Lock()
-	if current, ok := m.peers[peerID]; ok {
-		current.Endpoint = endpoint
-		current.ConnectedVia = "relay"
-		current.LastSeen = time.Now().UTC()
-	}
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *PeerManager) AttemptDirect(peerID string) error {
-	peers, err := m.fetchPeers()
-	if err != nil {
-		return fmt.Errorf("attempt direct: fetch peers: %w", err)
-	}
-	var target *api_client.PeerInfo
-	for i := range peers {
-		if peers[i].ID == peerID {
-			target = &peers[i]
-			break
-		}
-	}
-	if target == nil {
-		return fmt.Errorf("attempt direct: peer not found")
-	}
-	endpoint := preferIPv4(target.PublicEndpoint, target.LocalEndpoints)
-	if endpoint == "" {
-		return fmt.Errorf("attempt direct: peer has no direct endpoint")
-	}
-	m.mu.RLock()
-	conn, exists := m.peers[peerID]
-	m.mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("attempt direct: peer not connected")
-	}
-	if err := m.tunnel.UpdatePeerEndpoint(conn.PublicKey, endpoint); err != nil {
-		return fmt.Errorf("attempt direct: update tunnel endpoint: %w", err)
-	}
-	m.mu.Lock()
-	if current, ok := m.peers[peerID]; ok {
-		current.Endpoint = endpoint
-		current.ConnectedVia = "p2p"
-		current.LastSeen = time.Now().UTC()
-	}
-	m.mu.Unlock()
-	return nil
+	return false
 }
 
 func splitHostPort(endpoint string) (string, int, error) {
