@@ -353,8 +353,8 @@ func (a *Agent) sendMemberHeartbeat() error {
 	}
 
 	// Refresh public endpoint
-	if ip, port, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(port))
+	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
+		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
 			a.mu.Lock()
 			a.publicEndpoint = fresh
@@ -388,8 +388,8 @@ func (a *Agent) sendHeartbeat() error {
 		return fmt.Errorf("send heartbeat: peer id is empty")
 	}
 
-	if ip, port, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(port))
+	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
+		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
 			a.mu.Lock()
 			a.publicEndpoint = fresh
