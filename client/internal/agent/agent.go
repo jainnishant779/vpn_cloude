@@ -179,6 +179,7 @@ func (a *Agent) Start() error {
 	// The STUN socket uses a random port — WireGuard listens on wgPort.
 	// We discover the public IP via STUN but always pair it with wgPort.
 	a.state.Set(StateDiscovering)
+<<<<<<< HEAD
 	publicIP, _, stunErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
 	if stunErr != nil {
 		// Fallback: try to get public IP from local interfaces
@@ -189,6 +190,16 @@ func (a *Agent) Start() error {
 		}
 	}
 	// Use WireGuard's configured listen port so peers connect to the right port
+=======
+	publicIP, _, stunDiscoverErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
+	if stunDiscoverErr != nil {
+		publicIP = getOutboundIP()
+		if publicIP == "" {
+			publicIP = "127.0.0.1"
+		}
+	}
+	// CRITICAL: always use WireGuard listen port (51820), NOT the STUN socket port
+>>>>>>> 74e04af0d3a2a2cc71dbc1789ea446fcce0660c4
 	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(wgPort))
 
 	a.mu.Lock()
@@ -355,7 +366,11 @@ func (a *Agent) sendMemberHeartbeat() error {
 		return fmt.Errorf("send member heartbeat: member_id empty")
 	}
 
+<<<<<<< HEAD
 	// Re-discover public IP (handles IP changes) but keep WireGuard port
+=======
+	// Refresh public endpoint
+>>>>>>> 74e04af0d3a2a2cc71dbc1789ea446fcce0660c4
 	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
 		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
