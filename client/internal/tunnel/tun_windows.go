@@ -73,7 +73,7 @@ func (d *WindowsTUNDevice) SetupWireGuard(privateKey string, listenPort int) err
 	// Start UAPI listener so wg.exe can also communicate
 	uapi, err := ipc.UAPIListen(d.name)
 	if err == nil {
-		d.uapiSrv = uapi
+		d.uapiSrv, _ = uapi.(*ipc.UAPIListener)
 		go func() {
 			for {
 				c, err := uapi.Accept()
