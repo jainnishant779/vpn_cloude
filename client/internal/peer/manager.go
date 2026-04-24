@@ -174,6 +174,7 @@ func (m *PeerManager) syncPeersOnce() error {
 	return nil
 }
 
+<<<<<<< HEAD
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
 	// 1. Check if any local endpoint is on the same subnet as us (same LAN)
@@ -204,54 +205,62 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 					}
 					return ep
 				}
+=======
+// preferIPv4 selects best endpoint: LAN IP first, then public IP with WireGuard port.
+func preferIPv4(publicEndpoint string, localEndpoints []string) string {
+	myAddrs, _ := net.InterfaceAddrs()
+
+	// Priority 1: Same subnet (LAN) - avoids NAT hairpin issues
+	for _, ep := range localEndpoints {
+		host, port, err := net.SplitHostPort(ep)
+		if err != nil { host = ep; port = "51820" }
+		peerIP := net.ParseIP(host)
+		if peerIP == nil || peerIP.To4() == nil { continue }
+		if strings.HasPrefix(host, "169.254.") || host == "127.0.0.1" { continue }
+		for _, addr := range myAddrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil { continue }
+			if ipnet.Contains(peerIP) {
+				if port == "" { port = "51820" }
+				return net.JoinHostPort(host, port)
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 			}
 		}
 	}
 
+<<<<<<< HEAD
 	// 2. Check if public endpoint is IPv4 (not bracketed IPv6)
+=======
+	// Priority 2: Any private RFC1918 local endpoint
+	for _, ep := range localEndpoints {
+		host, port, err := net.SplitHostPort(ep)
+		if err != nil { host = ep; port = "51820" }
+		peerIP := net.ParseIP(host)
+		if peerIP == nil || peerIP.To4() == nil { continue }
+		if strings.HasPrefix(host, "169.254.") { continue }
+		s := host
+		isPrivate := strings.HasPrefix(s, "10.") || strings.HasPrefix(s, "192.168.") ||
+			(len(s) >= 7 && s[:7] >= "172.16." && s[:7] <= "172.31.")
+		if isPrivate {
+			if port == "" { port = "51820" }
+			return net.JoinHostPort(host, port)
+		}
+	}
+
+	// Priority 3: Public endpoint - always use port 51820
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
-		// Also verify it's actually IPv4 and has a port
 		host, _, err := net.SplitHostPort(publicEndpoint)
 		if err == nil {
 			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-				return publicEndpoint
+				return net.JoinHostPort(host, "51820")
 			}
 		}
-		// Bare IPv4 without port
 		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
-			return publicEndpoint + ":51820"
+			return net.JoinHostPort(publicEndpoint, "51820")
 		}
 	}
 
-	// Try local endpoints for IPv4 (great for same-LAN VNC)
-	for _, ep := range localEndpoints {
-		if strings.HasPrefix(ep, "[") {
-			continue // skip IPv6
-		}
-		if !strings.Contains(ep, ".") {
-			continue // not IPv4
-		}
-		// Skip link-local (169.254.x.x)
-		ipStr := ep
-		if strings.Contains(ipStr, ":") {
-			h, _, err := net.SplitHostPort(ipStr)
-			if err != nil {
-				continue
-			}
-			ipStr = h
-		}
-		if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil {
-			if strings.HasPrefix(ipStr, "169.254.") {
-				continue
-			}
-			if !strings.Contains(ep, ":") {
-				return ep + ":51820"
-			}
-			return ep
-		}
-	}
-
-	// Do NOT fall back to IPv6 — return empty so relay fallback kicks in
 	return ""
 }
 

@@ -158,6 +158,10 @@ func (a *Agent) Start() error {
 	// ── WireGuard tunnel ──────────────────────────────────────────────────────
 	wgPort := maxInt(a.config.WGListenPort, 51820)
 	var err error
+<<<<<<< HEAD
+=======
+	wgPort := maxInt(a.config.WGListenPort, 51820)
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, wgPort)
 	if err != nil {
 		return fmt.Errorf("agent start: create tunnel: %w", err)
@@ -193,7 +197,7 @@ func (a *Agent) Start() error {
 =======
 	publicIP, _, stunDiscoverErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
 	if stunDiscoverErr != nil {
-		publicIP = getOutboundIP()
+		publicIP = netutil.GetOutboundIP()
 		if publicIP == "" {
 			publicIP = "127.0.0.1"
 		}
@@ -227,7 +231,11 @@ func (a *Agent) Start() error {
 	if useMemberToken {
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
+<<<<<<< HEAD
 			LocalEndpoints: localIPsWithPort,
+=======
+			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
@@ -236,7 +244,11 @@ func (a *Agent) Start() error {
 			PeerID:         peerID,
 			NetworkID:      a.config.NetworkID,
 			PublicEndpoint: endpoint,
+<<<<<<< HEAD
 			LocalEndpoints: localIPsWithPort,
+=======
+			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		}); err != nil {
 			log.Warn().Err(err).Msg("announce failed (non-fatal)")
 		}
@@ -361,6 +373,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 	vncAvail  := a.vncAvailable
 	wgPort    := maxInt(a.config.WGListenPort, 51820)
 	a.mu.RUnlock()
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
@@ -402,6 +415,7 @@ func (a *Agent) sendHeartbeat() error {
 	vncAvail := a.vncAvailable
 	wgPort   := maxInt(a.config.WGListenPort, 51820)
 	a.mu.RUnlock()
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if peerID == "" {
 		return fmt.Errorf("send heartbeat: peer id is empty")
@@ -621,11 +635,19 @@ func getOutboundIP() string {
 	return addr.IP.String()
 }
 
+<<<<<<< HEAD
 // getLocalIPsWithPort returns local IPs with the given port appended.
 func getLocalIPsWithPort(port int) []string {
 	raw := netutil.GetLocalIPs()
 	result := make([]string, 0, len(raw))
 	for _, ip := range raw {
+=======
+// localIPsWithPort appends the given port to each local IP.
+// This ensures peers connect to the WireGuard port (51820), not a random port.
+func localIPsWithPort(ips []string, port int) []string {
+	result := make([]string, 0, len(ips))
+	for _, ip := range ips {
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		host, _, err := net.SplitHostPort(ip)
 		if err != nil {
 			host = ip
@@ -633,4 +655,8 @@ func getLocalIPsWithPort(port int) []string {
 		result = append(result, net.JoinHostPort(host, strconv.Itoa(port)))
 	}
 	return result
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> 91700f6385828200369dbdd7345eaad063a90c27

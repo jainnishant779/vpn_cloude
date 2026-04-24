@@ -8,13 +8,6 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// InstallScriptHandler serves:
-//   GET /install.sh              — bash installer (Linux/Mac)
-//   GET /join/{network_id}       — ZeroTier-style Linux one-liner
-//   GET /join/{network_id}/ps1   — Windows PowerShell one-liner
-//
-// Linux:   curl http://<server>/join/<network_id> | sudo bash
-// Windows: irm http://<server>/join/<network_id>/ps1 | iex
 type InstallScriptHandler struct {
 	serverURL string
 }
@@ -25,51 +18,22 @@ func NewInstallScriptHandler(serverURL string) *InstallScriptHandler {
 	}
 }
 
-// deriveServerURL determines the server URL to embed in install scripts.
-// Behind NGINX, r.Host loses the port (3.93.45.218:3000 → 3.93.45.218).
-// We use a 3-tier approach:
-//  1. X-Forwarded-Host (set by NGINX, preserves the original host:port)
-//  2. PUBLIC_SERVER_URL config (has the correct port)
-//  3. r.Host fallback (may be missing port behind a reverse proxy)
 func (h *InstallScriptHandler) deriveServerURL(r *http.Request) string {
+	if h.serverURL != "" {
+		return h.serverURL
+	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
-	}
-
-	// 1. X-Forwarded-Host preserves the original host:port from NGINX
-	if fwdHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); fwdHost != "" {
-		return fmt.Sprintf("%s://%s", scheme, fwdHost)
-	}
-
-	// 2. If r.Host includes a non-standard port, use it directly
-	if r.Host != "" && strings.Contains(r.Host, ":") {
-		return fmt.Sprintf("%s://%s", scheme, r.Host)
-	}
-
-	// 3. PUBLIC_SERVER_URL — has the correct IP:port from config
-	if h.serverURL != "" {
-		return h.serverURL
-	}
-
-	// 4. Bare r.Host (port 80/443 implied)
-	if r.Host != "" {
-		return fmt.Sprintf("%s://%s", scheme, r.Host)
-	}
-
-	return "http://localhost:3000"
+	return fmt.Sprintf("%s://%s", scheme, r.Host)
 }
 
-// ServeScript handles GET /install.sh
 func (h *InstallScriptHandler) ServeScript(w http.ResponseWriter, r *http.Request) {
 	script := buildInstallScript(h.deriveServerURL(r), "")
 	writeScript(w, script)
 }
 
-// ServeJoin handles GET /join/{network_id} — Linux/Mac one-liner
 func (h *InstallScriptHandler) ServeJoin(w http.ResponseWriter, r *http.Request) {
 	networkID := strings.TrimSpace(chi.URLParam(r, "network_id"))
 	if networkID == "" {
@@ -80,15 +44,13 @@ func (h *InstallScriptHandler) ServeJoin(w http.ResponseWriter, r *http.Request)
 	writeScript(w, script)
 }
 
-// ServeJoinPS1 handles GET /join/{network_id}/ps1 — Windows PowerShell one-liner
 func (h *InstallScriptHandler) ServeJoinPS1(w http.ResponseWriter, r *http.Request) {
 	networkID := strings.TrimSpace(chi.URLParam(r, "network_id"))
 	if networkID == "" {
 		http.Error(w, "network_id is required", http.StatusBadRequest)
 		return
 	}
-	serverURL := h.deriveServerURL(r)
-	script := buildPS1Script(serverURL, networkID)
+	script := buildPS1Script(h.deriveServerURL(r), networkID)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "inline; filename=install.ps1")
 	w.Header().Set("Cache-Control", "no-store")
@@ -111,55 +73,19 @@ func buildInstallScript(serverURL, networkID string) string {
 	} else {
 		networkBlock = fmt.Sprintf(`NETWORK_ID="${1:-}"
 if [ -z "$NETWORK_ID" ]; then
-  echo "Usage:  curl %s/install.sh | sudo bash -s -- <network_id>"
-  echo "Or:     curl %s/join/<network_id> | sudo bash"
+  echo "Usage: curl %s/install.sh | sudo bash -s -- <network_id>"
   exit 1
-fi`, serverURL, serverURL)
+fi`, serverURL)
 	}
 
 	return fmt.Sprintf(`#!/usr/bin/env bash
-# QuickTunnel — zero-touch installer (Linux/Mac)
+# QuickTunnel — zero-touch installer
 # Usage: curl %s/join/<network_id> | sudo bash
 set -euo pipefail
 
-_SERVER_URL="%s"
+SERVER_URL="%s"
 %s
 
-# ── Auto-detect correct server port ──────────────────────────────────────
-# NGINX proxy may strip the port. Try the URL as-is first, then common ports.
-detect_server_url() {
-  local url="$1"
-  # If URL already has a non-standard port, use it
-  if echo "$url" | grep -qE ':[0-9]+$'; then
-    echo "$url"
-    return
-  fi
-  # Try the URL as-is (port 80)
-  if curl -fsS --connect-timeout 3 "$url/health" >/dev/null 2>&1; then
-    echo "$url"
-    return
-  fi
-  # Try common ports: 3000, 8080
-  local host
-  host=$(echo "$url" | sed 's|^https\?://||')
-  for port in 3000 8080; do
-    local candidate
-    candidate=$(echo "$url" | sed "s|://.*|://${host}:${port}|")
-    if curl -fsS --connect-timeout 3 "$candidate/health" >/dev/null 2>&1; then
-      echo "$candidate"
-      return
-    fi
-  done
-  # Give up, return original
-  echo "$url"
-}
-
-SERVER_URL=$(detect_server_url "$_SERVER_URL")
-if [ "$SERVER_URL" != "$_SERVER_URL" ]; then
-  echo "[*] Auto-detected server at $SERVER_URL"
-fi
-
-# ── Detect platform ─────────────────────────────────────────────────────
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
@@ -168,65 +94,24 @@ case "$ARCH_RAW" in
   armv7*|armv6*) ARCH="armv7" ;;
   *) echo "Unsupported arch: $ARCH_RAW"; exit 1 ;;
 esac
-case "$OS" in
-  linux|darwin) ;;
-  *) echo "Unsupported OS: $OS"; exit 1 ;;
-esac
+
 echo "[1/4] Platform: $OS/$ARCH"
 
-# ── Stop old instance + clean up ─────────────────────────────────────────
-echo "[2/4] Cleaning up old instance..."
+echo "[2/4] Stopping old instance..."
 pkill -f quicktunnel 2>/dev/null || true
 ip link delete qtun0 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
 rm -f /usr/local/bin/quicktunnel
 sleep 1
 
-# ── WireGuard setup (Linux only) ─────────────────────────────────────────
 if [ "$OS" = "linux" ]; then
-  WG_READY=false
-
-  # Try kernel module first
-  if lsmod | grep -q wireguard 2>/dev/null; then
-    WG_READY=true
-  elif modprobe wireguard 2>/dev/null; then
-    WG_READY=true
-  fi
-
-  # Install wireguard-tools if not present
+  modprobe wireguard 2>/dev/null || true
   if ! command -v wg &>/dev/null; then
-    echo "[*] Installing wireguard-tools..."
-    if command -v apt-get &>/dev/null; then
-      apt-get update -qq && apt-get install -y -qq wireguard-tools 2>/dev/null || true
-    elif command -v dnf &>/dev/null; then
-      dnf install -y wireguard-tools 2>/dev/null || true
-    elif command -v yum &>/dev/null; then
-      yum install -y wireguard-tools 2>/dev/null || true
-    fi
-  fi
-
-  # If kernel module still not available, install wireguard-go (userspace)
-  if [ "$WG_READY" = "false" ]; then
-    echo "[*] Kernel module unavailable (custom kernel?), installing wireguard-go..."
-    if command -v apt-get &>/dev/null; then
-      apt-get install -y -qq wireguard-go 2>/dev/null || true
-    fi
-    # If apt didn't have it, try go install
-    if ! command -v wireguard-go &>/dev/null; then
-      if command -v go &>/dev/null; then
-        GOBIN=/usr/local/bin go install golang.zx2c4.com/wireguard-go@latest 2>/dev/null || true
-      fi
-    fi
-    if command -v wireguard-go &>/dev/null; then
-      echo "      wireguard-go installed (userspace mode)"
-    else
-      echo "[!] Warning: WireGuard kernel module and wireguard-go both unavailable"
-      echo "    Install manually: apt install wireguard-go  OR  go install golang.zx2c4.com/wireguard-go@latest"
-    fi
+    apt-get install -y -qq wireguard-tools 2>/dev/null || \
+    yum install -y wireguard-tools 2>/dev/null || true
   fi
 fi
 
-# ── Download binary ───────────────────────────────────────────────────────
 BINARY="/usr/local/bin/quicktunnel"
 DOWNLOAD_URL="$SERVER_URL/api/v1/downloads/client/$OS/$ARCH"
 echo "[3/4] Downloading from $DOWNLOAD_URL ..."
@@ -234,34 +119,50 @@ if command -v curl &>/dev/null; then
   curl -fsSL "$DOWNLOAD_URL" -o "$BINARY"
 elif command -v wget &>/dev/null; then
   wget -qO "$BINARY" "$DOWNLOAD_URL"
-else
-  echo "Error: curl or wget required"; exit 1
 fi
 chmod +x "$BINARY"
-echo "      Saved to $BINARY"
 
-# ── Join network ──────────────────────────────────────────────────────────
 echo "[4/4] Joining network: $NETWORK_ID"
 exec "$BINARY" join "$SERVER_URL" "$NETWORK_ID"
 `, serverURL, serverURL, networkBlock)
 }
 
 func buildPS1Script(serverURL, networkID string) string {
-	return fmt.Sprintf(`# QuickTunnel — Windows one-liner installer
+	return fmt.Sprintf(`# QuickTunnel — Windows installer
 # Run in PowerShell as Administrator:
 # irm %s/join/%s/ps1 | iex
 
 $ErrorActionPreference = "Stop"
-$ServerURL  = "%s"
-$NetworkID  = "%s"
-$BinaryPath = "$env:ProgramFiles\QuickTunnel\quicktunnel.exe"
-$WintunPath = "$env:ProgramFiles\QuickTunnel\wintun.dll"
+$ServerURL   = "%s"
+$NetworkID   = "%s"
+$QtDir       = "$env:ProgramFiles\QuickTunnel"
+$BinaryPath  = "$QtDir\quicktunnel.exe"
+$WintunPath  = "$QtDir\wintun.dll"
+$WGPath      = "$env:ProgramFiles\WireGuard"
 $DownloadURL = "$ServerURL/api/v1/downloads/client/windows/amd64"
 
-Write-Host "[1/4] Setting up QuickTunnel directory..."
-New-Item -ItemType Directory -Force -Path "$env:ProgramFiles\QuickTunnel" | Out-Null
+Write-Host "[1/5] Setting up directories..."
+New-Item -ItemType Directory -Force -Path $QtDir | Out-Null
 
-Write-Host "[2/4] Downloading WinTun driver..."
+Write-Host "[2/5] Installing WireGuard (required for full TCP/UDP support)..."
+if (-not (Test-Path "$WGPath\wireguard.exe")) {
+    $wgInstaller = "$env:TEMP\wireguard-installer.exe"
+    Write-Host "      Downloading WireGuard installer..."
+    Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" -OutFile $wgInstaller -UseBasicParsing
+    Write-Host "      Installing WireGuard (may open UAC prompt)..."
+    Start-Process -FilePath $wgInstaller -ArgumentList "/S" -Wait
+    Write-Host "      WireGuard installed."
+} else {
+    Write-Host "      WireGuard already installed."
+}
+
+# Add WireGuard to PATH so wg.exe is accessible
+if ($env:PATH -notlike "*WireGuard*") {
+    $env:PATH += ";$WGPath"
+    [Environment]::SetEnvironmentVariable("PATH", "$env:PATH", "Machine")
+}
+
+Write-Host "[3/5] Installing WinTun driver..."
 if (-not (Test-Path $WintunPath)) {
     $wintunZip = "$env:TEMP\wintun.zip"
     Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -UseBasicParsing
@@ -272,20 +173,17 @@ if (-not (Test-Path $WintunPath)) {
     Write-Host "      WinTun already present."
 }
 
-Write-Host "[3/4] Downloading QuickTunnel binary..."
-# Stop old instance first
+Write-Host "[4/5] Downloading QuickTunnel..."
 Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
 Invoke-WebRequest -Uri $DownloadURL -OutFile $BinaryPath -UseBasicParsing
 Write-Host "      Saved to $BinaryPath"
 
-# Add to PATH if not already there
-$currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
-if ($currentPath -notlike "*QuickTunnel*") {
-    [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$env:ProgramFiles\QuickTunnel", "Machine")
-    $env:PATH += ";$env:ProgramFiles\QuickTunnel"
+if ($env:PATH -notlike "*QuickTunnel*") {
+    [Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$QtDir", "Machine")
+    $env:PATH += ";$QtDir"
 }
 
-Write-Host "[4/4] Joining network $NetworkID ..."
+Write-Host "[5/5] Joining network $NetworkID ..."
 & $BinaryPath join $ServerURL $NetworkID
 `, serverURL, networkID, serverURL, networkID)
 }
