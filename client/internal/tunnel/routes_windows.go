@@ -36,68 +36,34 @@ func addHostRoute(peerIP, deviceName string) error {
 }
 
 func removeHostRoute(peerIP, deviceName string) error {
-	out, err := exec.Command("netsh", "interface", "ipv4", "delete", "route",
+	_, _ = exec.Command("netsh", "interface", "ipv4", "delete", "route",
 		peerIP+"/32", deviceName).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "not found") {
-		fmt.Printf("[WARN] remove host route: %s\n", strings.TrimSpace(string(out)))
+		fmt.Printf("[WARN] remove peer route failed: %s — %v\n", strings.TrimSpace(string(out)), err)
+		return err
 	}
 	return nil
 }
 
-// wgConfTemplate is the WireGuard config file format.
-// Windows WireGuard reads this via `wireguard.exe /installtunnelservice`.
-const wgConfTemplate = `[Interface]
-PrivateKey = {{.PrivateKey}}
-ListenPort = {{.ListenPort}}
-`
-
-// configureWG sets up WireGuard on Windows using a config file approach.
-// It writes a temp .conf file and uses `wireguard.exe` to install the tunnel.
 func configureWG(deviceName, privateKey string, listenPort int) (bool, error) {
-	// Method 1: Try wireguard-go based approach (our tun.Device already created)
-	// Windows WireGuard tunnel service path
-	wgExePaths := []string{
-		`C:\Program Files\WireGuard\wg.exe`,
-		`C:\Program Files (x86)\WireGuard\wg.exe`,
-		`C:\Windows\System32\wg.exe`,
-	}
-
-	var wgExe string
-	for _, p := range wgExePaths {
-		if _, err := os.Stat(p); err == nil {
-			wgExe = p
-			break
-		}
-	}
-	if wgExe == "" {
-		if p, err := exec.LookPath("wg.exe"); err == nil {
-			wgExe = p
-		} else if p, err := exec.LookPath("wg"); err == nil {
-			wgExe = p
-		}
-	}
-
-	if wgExe == "" {
-		// wg.exe not found — write config file for wireguard-go userspace
-		return configureWGViaConfigFile(deviceName, privateKey, listenPort)
-	}
-
-	// Use wg.exe to configure the interface
-	tmpFile, err := os.CreateTemp("", "wgkey-*.txt")
+	// Windows WireGuard uses config files, not wg set
+	// Write temp config and install tunnel service
+	_, err := exec.LookPath("wireguard.exe")
 	if err != nil {
-		return false, fmt.Errorf("create temp key file: %w", err)
+		return false, fmt.Errorf("wireguard.exe not found")
 	}
-	defer os.Remove(tmpFile.Name())
-	_, _ = tmpFile.WriteString(privateKey)
-	_ = tmpFile.Close()
-
-	cmd := exec.Command(wgExe, "set", deviceName,
+	// For now, attempt wg.exe if available
+	wgPath, err := exec.LookPath("wg")
+	if err != nil {
+		return false, fmt.Errorf("wg.exe not found")
+	}
+	cmd := exec.Command(wgPath, "set", deviceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
-		"private-key", tmpFile.Name())
+		"private-key", "CON")
+	cmd.Stdin = strings.NewReader(privateKey)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("[WARN] wg set failed: %s — trying config file approach\n", strings.TrimSpace(string(out)))
-		return configureWGViaConfigFile(deviceName, privateKey, listenPort)
+		return false, fmt.Errorf("%s — %v", strings.TrimSpace(string(out)), err)
 	}
 	return true, nil
 }
@@ -143,17 +109,13 @@ func configureWGViaConfigFile(deviceName, privateKey string, listenPort int) (bo
 }
 
 func addWGPeer(deviceName, publicKey, endpoint, allowedIP string) error {
-	wgExe := findWGExe()
-	if wgExe == "" {
-		return fmt.Errorf("wg.exe not found")
-	}
-	out, err := exec.Command(wgExe, "set", deviceName,
+	out, err := exec.Command("wg", "set", deviceName,
 		"peer", publicKey,
 		"endpoint", endpoint,
 		"allowed-ips", allowedIP,
 		"persistent-keepalive", "25").CombinedOutput()
 	if err != nil {
-		fmt.Printf("[WARN] add wg peer: %s\n", strings.TrimSpace(string(out)))
+		fmt.Printf("[WARN] add wg peer failed: %s — %v\n", strings.TrimSpace(string(out)), err)
 		return err
 	}
 	return nil
@@ -180,22 +142,3 @@ func updateWGPeerEndpoint(deviceName, publicKey, endpoint string) error {
 	return nil
 }
 
-func findWGExe() string {
-	candidates := []string{
-		`C:\Program Files\WireGuard\wg.exe`,
-		`C:\Program Files (x86)\WireGuard\wg.exe`,
-		`C:\Windows\System32\wg.exe`,
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	if p, err := exec.LookPath("wg.exe"); err == nil {
-		return p
-	}
-	if p, err := exec.LookPath("wg"); err == nil {
-		return p
-	}
-	return ""
-}
