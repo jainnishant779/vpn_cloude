@@ -186,7 +186,7 @@ func (a *Agent) Start() error {
 	a.state.Set(StateDiscovering)
 	publicIP, _, stunDiscoverErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
 	if stunDiscoverErr != nil {
-		publicIP = getOutboundIP()
+		publicIP = netutil.GetOutboundIP()
 		if publicIP == "" {
 			publicIP = "127.0.0.1"
 		}
@@ -348,6 +348,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
@@ -384,6 +385,7 @@ func (a *Agent) sendHeartbeat() error {
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if peerID == "" {
 		return fmt.Errorf("send heartbeat: peer id is empty")
