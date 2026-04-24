@@ -168,7 +168,8 @@ func (a *Agent) Start() error {
 
 	// ── WireGuard tunnel ──────────────────────────────────────────────────────
 	var err error
-	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, maxInt(a.config.WGListenPort, 51820))
+	wgPort := maxInt(a.config.WGListenPort, 51820)
+	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, wgPort)
 	if err != nil {
 		return fmt.Errorf("agent start: create tunnel: %w", err)
 	}
@@ -201,7 +202,7 @@ func (a *Agent) Start() error {
 	if useMemberToken {
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
-			LocalEndpoints: netutil.GetLocalIPs(),
+			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
@@ -210,7 +211,7 @@ func (a *Agent) Start() error {
 			PeerID:         peerID,
 			NetworkID:      a.config.NetworkID,
 			PublicEndpoint: endpoint,
-			LocalEndpoints: netutil.GetLocalIPs(),
+			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
 		}); err != nil {
 			log.Warn().Err(err).Msg("announce failed (non-fatal, tunnel will still start)")
 		}
@@ -573,4 +574,18 @@ func (a *Agent) startPacketForwarding() {
 			_, _ = a.tunnel.WritePacket(buf[4:n])
 		}
 	}()
+}
+
+// localIPsWithPort appends the given port to each local IP.
+// This ensures peers connect to the WireGuard port (51820), not a random port.
+func localIPsWithPort(ips []string, port int) []string {
+	result := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		host, _, err := net.SplitHostPort(ip)
+		if err != nil {
+			host = ip
+		}
+		result = append(result, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return result
 }
