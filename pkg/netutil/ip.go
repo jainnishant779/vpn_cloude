@@ -3,6 +3,7 @@ package netutil
 import (
 	"net"
 	"sort"
+	"strings"
 )
 
 // AllocateIP selects the next available host IP in a CIDR for virtual peer assignment.
@@ -11,23 +12,19 @@ func AllocateIP(cidr string, existing []string) string {
 	if err != nil {
 		return ""
 	}
-
 	networkIP := ipnet.IP.To4()
 	if networkIP == nil {
 		return ""
 	}
-
 	mask := maskToUint32(ipnet.Mask)
 	if mask == 0 {
 		return ""
 	}
-
 	network := ipToUint32(networkIP.Mask(ipnet.Mask))
 	broadcast := network | ^mask
 	if broadcast <= network+2 {
 		return ""
 	}
-
 	used := make(map[uint32]struct{}, len(existing))
 	for _, raw := range existing {
 		parsed := net.ParseIP(raw).To4()
@@ -36,11 +33,8 @@ func AllocateIP(cidr string, existing []string) string {
 		}
 		used[ipToUint32(parsed)] = struct{}{}
 	}
-
 	for candidate := network + 2; candidate < broadcast; candidate++ {
 		ip := uint32ToIP(candidate)
-
-		// Skip x.x.x.255 to avoid common broadcast ambiguity in mixed subnet setups.
 		if ip[3] == 255 {
 			continue
 		}
@@ -52,7 +46,6 @@ func AllocateIP(cidr string, existing []string) string {
 		}
 		return ip.String()
 	}
-
 	return ""
 }
 
@@ -65,7 +58,42 @@ func IsPrivateIP(ip string) bool {
 	return parsed.IsPrivate() || parsed.IsLoopback()
 }
 
-// GetLocalIPs returns active non-loopback IPv4 addresses in stable order.
+// isVirtualInterface returns true for interfaces that are VPN tunnels,
+// ZeroTier overlays, Docker bridges, or other virtual adapters.
+// These should NOT be announced as local endpoints because peers cannot
+// reach them directly over WireGuard.
+func isVirtualInterface(name string) bool {
+	virtual := []string{
+		"zt",        // ZeroTier
+		"tun",       // generic TUN
+		"tap",       // generic TAP
+		"wg",        // WireGuard interfaces
+		"qtun",      // QuickTunnel
+		"docker",    // Docker bridge
+		"br-",       // Linux bridges
+		"virbr",     // libvirt bridge
+		"veth",      // Docker veth pairs
+		"vmnet",     // VMware
+		"vboxnet",   // VirtualBox
+		"utun",      // macOS VPN TUN
+		"awdl",      // Apple Wireless Direct Link
+		"llw",       // Low Latency WLAN
+		"ppp",       // PPP
+		"gpd",       // Generic Packet Data
+		"pdp_ip",    // iOS cellular
+	}
+	lower := strings.ToLower(name)
+	for _, prefix := range virtual {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetLocalIPs returns active non-loopback IPv4 addresses from PHYSICAL interfaces only.
+// Virtual interfaces (ZeroTier, Docker, TUN/TAP, WireGuard) are excluded because
+// announcing them as local endpoints causes WireGuard handshake failures.
 func GetLocalIPs() []string {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -73,10 +101,17 @@ func GetLocalIPs() []string {
 	}
 
 	seen := map[string]struct{}{}
-	ips := make([]string, 0, len(interfaces))
+	ips := make([]string, 0, 4)
 
 	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		// Skip down, loopback, or virtual interfaces
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isVirtualInterface(iface.Name) {
 			continue
 		}
 
@@ -98,6 +133,10 @@ func GetLocalIPs() []string {
 
 			ipv4 := ip.To4()
 			if ipv4 == nil {
+				continue
+			}
+			// Skip link-local
+			if ipv4[0] == 169 && ipv4[1] == 254 {
 				continue
 			}
 
@@ -125,7 +164,6 @@ func GetOutboundIP() string {
 			}
 		}
 	}
-
 	local := GetLocalIPs()
 	if len(local) == 0 {
 		return ""
