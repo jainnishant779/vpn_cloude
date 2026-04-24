@@ -183,11 +183,15 @@ func (a *Agent) Start() error {
 
 	// ── Endpoint discovery ────────────────────────────────────────────────────
 	a.state.Set(StateDiscovering)
-	publicIP, publicPort, err := nat.DiscoverPublicEndpoint(a.config.STUNServer)
-	if err != nil {
-		return fmt.Errorf("agent start: discover public endpoint: %w", err)
+	publicIP, _, stunDiscoverErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
+	if stunDiscoverErr != nil {
+		publicIP = getOutboundIP()
+		if publicIP == "" {
+			publicIP = "127.0.0.1"
+		}
 	}
-	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(publicPort))
+	// CRITICAL: always use WireGuard listen port (51820), NOT the STUN socket port
+	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(wgPort))
 
 	a.mu.Lock()
 	a.publicEndpoint = endpoint
