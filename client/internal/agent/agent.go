@@ -42,8 +42,8 @@ type Agent struct {
 	mu             sync.RWMutex
 	virtualIP      string
 	peerID         string
-	memberID       string // ZeroTier-style join
-	memberToken    string // ZeroTier-style join
+	memberID       string
+	memberToken    string
 	publicEndpoint string
 	vncPort        int
 	vncAvailable   bool
@@ -79,15 +79,6 @@ func (a *Agent) Start() error {
 
 	a.state.Set(StateAuthenticating)
 
-	// ── Decide auth mode ──────────────────────────────────────────────────────
-	//
-	// Mode A  (ZeroTier-style, no API key):
-	//   Config has MemberToken + MemberID + WGPrivateKey set from the join flow.
-	//   Use /api/v1/members/{mid}/heartbeat  and  /api/v1/members/{mid}/peers.
-	//
-	// Mode B  (classic, API key):
-	//   Use /api/v1/networks/{id}/peers/register  +  heartbeat.
-	//
 	useMemberToken := strings.TrimSpace(a.config.MemberToken) != "" &&
 		strings.TrimSpace(a.config.MemberID) != "" &&
 		strings.TrimSpace(a.config.WGPrivateKey) != ""
@@ -102,7 +93,6 @@ func (a *Agent) Start() error {
 	)
 
 	if useMemberToken {
-		// ── Mode A: ZeroTier-style ─────────────────────────────────────────
 		log.Info().Msg("using member_token auth (ZeroTier-style)")
 		a.apiClient.SetMemberToken(a.config.MemberToken)
 
@@ -117,7 +107,6 @@ func (a *Agent) Start() error {
 		a.mu.Unlock()
 
 	} else {
-		// ── Mode B: classic API key ────────────────────────────────────────
 		if strings.TrimSpace(a.config.APIKey) == "" {
 			if strings.TrimSpace(a.config.Email) == "" || strings.TrimSpace(a.config.Password) == "" {
 				return fmt.Errorf("agent start: api_key or (email/password) is required\n" +
@@ -167,8 +156,9 @@ func (a *Agent) Start() error {
 	a.mu.Unlock()
 
 	// ── WireGuard tunnel ──────────────────────────────────────────────────────
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 	var err error
-	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, maxInt(a.config.WGListenPort, 51820))
+	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, wgPort)
 	if err != nil {
 		return fmt.Errorf("agent start: create tunnel: %w", err)
 	}
@@ -176,28 +166,57 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("agent start: start tunnel: %w", err)
 	}
 
+	// ── Hole puncher (for relay fallback + NAT traversal) ────────────────────
+	// Use port 0 (random) — WireGuard owns the real port
 	a.holePuncher, err = nat.NewHolePuncher(0)
 	if err != nil {
-		return fmt.Errorf("agent start: create hole puncher: %w", err)
+		// Non-fatal: relay fallback won't work but tunnel still functions
+		log.Warn().Err(err).Msg("agent start: create hole puncher failed (non-fatal)")
 	}
 
 	// ── Endpoint discovery ────────────────────────────────────────────────────
+	// CRITICAL FIX: Announce WireGuard's actual listen port, not the STUN socket port.
+	// The STUN socket uses a random port — WireGuard listens on wgPort.
+	// We discover the public IP via STUN but always pair it with wgPort.
 	a.state.Set(StateDiscovering)
-	publicIP, publicPort, err := nat.DiscoverPublicEndpoint(a.config.STUNServer)
-	if err != nil {
-		return fmt.Errorf("agent start: discover public endpoint: %w", err)
+	publicIP, _, stunErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
+	if stunErr != nil {
+		// Fallback: try to get public IP from local interfaces
+		publicIP = getOutboundIP()
+		if publicIP == "" {
+			log.Warn().Err(stunErr).Msg("agent start: STUN discovery failed — using loopback")
+			publicIP = "127.0.0.1"
+		}
 	}
-	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(publicPort))
+	// Use WireGuard's configured listen port so peers connect to the right port
+	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(wgPort))
 
 	a.mu.Lock()
 	a.publicEndpoint = endpoint
 	a.mu.Unlock()
 
+	log.Info().
+		Str("public_endpoint", endpoint).
+		Int("wg_port", wgPort).
+		Bool("wg_ready", a.tunnel.IsWGReady()).
+		Msg("endpoint discovered")
+
 	// ── Announce endpoint ─────────────────────────────────────────────────────
+	localIPs := netutil.GetLocalIPs()
+	// Also add local IPs with WireGuard port for LAN direct connection
+	localIPsWithPort := make([]string, 0, len(localIPs))
+	for _, ip := range localIPs {
+		host, _, err := net.SplitHostPort(ip)
+		if err != nil {
+			host = ip
+		}
+		localIPsWithPort = append(localIPsWithPort, net.JoinHostPort(host, strconv.Itoa(wgPort)))
+	}
+
 	if useMemberToken {
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
-			LocalEndpoints: netutil.GetLocalIPs(),
+			LocalEndpoints: localIPsWithPort,
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
@@ -206,9 +225,9 @@ func (a *Agent) Start() error {
 			PeerID:         peerID,
 			NetworkID:      a.config.NetworkID,
 			PublicEndpoint: endpoint,
-			LocalEndpoints: netutil.GetLocalIPs(),
+			LocalEndpoints: localIPsWithPort,
 		}); err != nil {
-			log.Warn().Err(err).Msg("announce failed (non-fatal, tunnel will still start)")
+			log.Warn().Err(err).Msg("announce failed (non-fatal)")
 		}
 	}
 
@@ -233,7 +252,17 @@ func (a *Agent) Start() error {
 		a.peerMgr.SetMemberID(peerID)
 	}
 	a.peerMgr.Start()
-	a.startPacketForwarding()
+
+	// CRITICAL FIX: Only start raw packet forwarding when WireGuard kernel/userspace
+	// mode is NOT active. With real WireGuard, the kernel handles ALL packet I/O —
+	// calling startPacketForwarding causes a CPU-spinning busy loop because
+	// LinuxWGDevice.Read() returns (0, nil) and never blocks.
+	if !a.tunnel.IsWGReady() {
+		log.Warn().Msg("WireGuard not ready — using raw TUN packet forwarding (ICMP only, TCP/UDP limited)")
+		a.startPacketForwarding()
+	} else {
+		log.Info().Msg("WireGuard kernel/userspace mode active — kernel handles packet forwarding")
+	}
 
 	a.wg.Add(3)
 	go func() { defer a.wg.Done(); a.heartbeatLoop(useMemberToken) }()
@@ -244,7 +273,9 @@ func (a *Agent) Start() error {
 	log.Info().
 		Str("peer_id", peerID).
 		Str("virtual_ip", virtualIP).
+		Str("endpoint", endpoint).
 		Bool("zerotier_mode", useMemberToken).
+		Bool("wg_ready", a.tunnel.IsWGReady()).
 		Msg("QuickTunnel running")
 	return nil
 }
@@ -252,9 +283,6 @@ func (a *Agent) Start() error {
 func (a *Agent) Stop() error {
 	a.cancel()
 	a.wg.Wait()
-
-	// Signal server that we're going offline (best-effort)
-	a.signalOffline()
 
 	var firstErr error
 	if a.peerMgr != nil {
@@ -274,28 +302,6 @@ func (a *Agent) Stop() error {
 	}
 	a.state.Set(StateStopped)
 	return firstErr
-}
-
-// signalOffline tells the server this peer is going offline.
-func (a *Agent) signalOffline() {
-	if a.apiClient == nil {
-		return
-	}
-	a.mu.RLock()
-	memberID := a.memberID
-	peerID := a.peerID
-	a.mu.RUnlock()
-
-	if memberID != "" {
-		if err := a.apiClient.MemberGoOffline(memberID); err != nil {
-			log.Warn().Err(err).Msg("agent stop: failed to signal offline (non-fatal)")
-		}
-	} else if peerID != "" {
-		// For classic mode, send a heartbeat with empty endpoint to signal offline
-		_ = a.apiClient.Heartbeat(a.config.NetworkID, peerID, api_client.PeerStatus{
-			PublicEndpoint: "",
-		})
-	}
 }
 
 func (a *Agent) heartbeatLoop(useMemberToken bool) {
@@ -321,7 +327,7 @@ func (a *Agent) heartbeatLoop(useMemberToken bool) {
 				if wait > maxReconnectBackoff {
 					wait = maxReconnectBackoff
 				}
-				log.Warn().Err(err).Dur("backoff", wait).Msg("heartbeat failed")
+				log.Warn().Err(err).Dur("backoff", wait).Int("failures", failures).Msg("heartbeat failed")
 				select {
 				case <-time.After(wait):
 				case <-a.ctx.Done():
@@ -339,18 +345,19 @@ func (a *Agent) heartbeatLoop(useMemberToken bool) {
 
 func (a *Agent) sendMemberHeartbeat() error {
 	a.mu.RLock()
-	memberID := a.memberID
-	endpoint := a.publicEndpoint
-	vncAvail := a.vncAvailable
+	memberID  := a.memberID
+	endpoint  := a.publicEndpoint
+	vncAvail  := a.vncAvailable
+	wgPort    := maxInt(a.config.WGListenPort, 51820)
 	a.mu.RUnlock()
 
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
 	}
 
-	// Refresh public endpoint
-	if ip, port, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(port))
+	// Re-discover public IP (handles IP changes) but keep WireGuard port
+	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
+		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
 			a.mu.Lock()
 			a.publicEndpoint = fresh
@@ -358,7 +365,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 			endpoint = fresh
 			_ = a.apiClient.MemberAnnounce(memberID, api_client.MemberAnnounceRequest{
 				PublicEndpoint: fresh,
-				LocalEndpoints: netutil.GetLocalIPs(),
+				LocalEndpoints: getLocalIPsWithPort(wgPort),
 			})
 		}
 	}
@@ -366,7 +373,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 	stats := a.tunnel.GetStats()
 	return a.apiClient.MemberHeartbeat(memberID, api_client.MemberHeartbeatRequest{
 		PublicEndpoint: endpoint,
-		LocalEndpoints: netutil.GetLocalIPs(),
+		LocalEndpoints: getLocalIPsWithPort(wgPort),
 		VNCAvailable:   vncAvail,
 		RXBytes:        int64(stats.RXBytes),
 		TXBytes:        int64(stats.TXBytes),
@@ -378,14 +385,15 @@ func (a *Agent) sendHeartbeat() error {
 	peerID   := a.peerID
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
+	wgPort   := maxInt(a.config.WGListenPort, 51820)
 	a.mu.RUnlock()
 
 	if peerID == "" {
 		return fmt.Errorf("send heartbeat: peer id is empty")
 	}
 
-	if ip, port, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(port))
+	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
+		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
 			a.mu.Lock()
 			a.publicEndpoint = fresh
@@ -395,7 +403,7 @@ func (a *Agent) sendHeartbeat() error {
 				PeerID:         peerID,
 				NetworkID:      a.config.NetworkID,
 				PublicEndpoint: fresh,
-				LocalEndpoints: netutil.GetLocalIPs(),
+				LocalEndpoints: getLocalIPsWithPort(wgPort),
 			})
 		}
 	}
@@ -403,7 +411,7 @@ func (a *Agent) sendHeartbeat() error {
 	stats := a.tunnel.GetStats()
 	return a.apiClient.Heartbeat(a.config.NetworkID, peerID, api_client.PeerStatus{
 		PublicEndpoint: endpoint,
-		LocalEndpoints: netutil.GetLocalIPs(),
+		LocalEndpoints: getLocalIPsWithPort(wgPort),
 		VNCAvailable:   vncAvail,
 		RXBytes:        int64(stats.RXBytes),
 		TXBytes:        int64(stats.TXBytes),
@@ -458,6 +466,78 @@ func (a *Agent) qualityMonitorLoop() {
 	}
 }
 
+// startPacketForwarding runs the raw TUN data plane.
+// Only called when real WireGuard (kernel or userspace) is NOT available.
+// With real WireGuard, the kernel handles all packet I/O — calling this
+// would cause a 100% CPU busy loop.
+func (a *Agent) startPacketForwarding() {
+	if a.holePuncher == nil {
+		return
+	}
+	conn := a.holePuncher.Conn()
+	if conn == nil {
+		return
+	}
+	magic := []byte{0x51, 0x54, 0x44, 0x54}
+
+	// outbound: TUN → UDP
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 65536)
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+			n, err := a.tunnel.ReadPacket(buf)
+			if err != nil || n < 20 {
+				if n == 0 {
+					// Avoid busy loop — sleep briefly when no data
+					time.Sleep(1 * time.Millisecond)
+				}
+				continue
+			}
+			destIP := net.IP(buf[16:20]).String()
+			endpoint, ok := a.tunnel.FindEndpointByVirtualIP(destIP)
+			if !ok {
+				continue
+			}
+			peerAddr, err := net.ResolveUDPAddr("udp", endpoint)
+			if err != nil {
+				continue
+			}
+			pkt := make([]byte, 4+n)
+			copy(pkt, magic)
+			copy(pkt[4:], buf[:n])
+			_, _ = conn.WriteToUDP(pkt, peerAddr)
+		}
+	}()
+
+	// inbound: UDP → TUN
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		buf := make([]byte, 65536)
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil || n < 24 {
+				continue
+			}
+			if buf[0] != magic[0] || buf[1] != magic[1] || buf[2] != magic[2] || buf[3] != magic[3] {
+				continue
+			}
+			_, _ = a.tunnel.WritePacket(buf[4:n])
+		}
+	}()
+}
+
 func (a *Agent) Status() map[string]any {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -472,6 +552,7 @@ func (a *Agent) Status() map[string]any {
 		"public_endpoint": a.publicEndpoint,
 		"vnc_port":        a.vncPort,
 		"vnc_available":   a.vncAvailable,
+		"wg_ready":        a.tunnel != nil && a.tunnel.IsWGReady(),
 		"connections":     connections,
 	}
 }
@@ -511,62 +592,30 @@ func isLocalPortOpen(port int) bool {
 	return true
 }
 
-func (a *Agent) startPacketForwarding() {
-	conn := a.holePuncher.Conn()
-	if conn == nil {
-		return
+// getOutboundIP returns the device's outbound IP by connecting to a public DNS.
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
 	}
-	// outbound: TUN → UDP
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		buf := make([]byte, 65536)
-		magic := []byte{0x51, 0x54, 0x44, 0x54}
-		for {
-			select {
-			case <-a.ctx.Done():
-				return
-			default:
-			}
-			n, err := a.tunnel.ReadPacket(buf)
-			if err != nil || n < 20 {
-				continue
-			}
-			destIP := net.IP(buf[16:20]).String()
-			endpoint, ok := a.tunnel.FindEndpointByVirtualIP(destIP)
-			if !ok {
-				continue
-			}
-			peerAddr, err := net.ResolveUDPAddr("udp", endpoint)
-			if err != nil {
-				continue
-			}
-			pkt := make([]byte, 4+n)
-			copy(pkt, magic)
-			copy(pkt[4:], buf[:n])
-			_, _ = conn.WriteToUDP(pkt, peerAddr)
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+	return addr.IP.String()
+}
+
+// getLocalIPsWithPort returns local IPs with the given port appended.
+func getLocalIPsWithPort(port int) []string {
+	raw := netutil.GetLocalIPs()
+	result := make([]string, 0, len(raw))
+	for _, ip := range raw {
+		host, _, err := net.SplitHostPort(ip)
+		if err != nil {
+			host = ip
 		}
-	}()
-	// inbound: UDP → TUN
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		buf := make([]byte, 65536)
-		magic := []byte{0x51, 0x54, 0x44, 0x54}
-		for {
-			select {
-			case <-a.ctx.Done():
-				return
-			default:
-			}
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil || n < 24 {
-				continue
-			}
-			if buf[0] != magic[0] || buf[1] != magic[1] || buf[2] != magic[2] || buf[3] != magic[3] {
-				continue
-			}
-			_, _ = a.tunnel.WritePacket(buf[4:n])
-		}
-	}()
+		result = append(result, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return result
 }

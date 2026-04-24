@@ -20,9 +20,9 @@ type TunnelStats struct {
 
 type PeerConfig struct {
 	PublicKey     string
-	Endpoint     string
-	AllowedIP    string
-	AddedAt      time.Time
+	Endpoint      string
+	AllowedIP     string
+	AddedAt       time.Time
 	LastHandshake time.Time
 }
 
@@ -33,14 +33,13 @@ type WGTunnel struct {
 	listenPort int
 	deviceName string
 	mtu        int
-	wgReady    bool
+	wgReady    bool // true when real WireGuard (kernel or userspace) is configured
 
 	mu      sync.RWMutex
 	started bool
 	device  TUNDevice
 	peers   map[string]*PeerConfig
 	stats   TunnelStats
-	wgPath  string
 }
 
 func networkAddr(ip string, maskBits int) string {
@@ -84,6 +83,14 @@ func NewWGTunnel(privateKey, virtualIP, cidr string, listenPort int) (*WGTunnel,
 	}, nil
 }
 
+// IsWGReady returns true if real WireGuard (kernel or userspace) is active.
+// When false, the agent falls back to raw TUN packet forwarding.
+func (w *WGTunnel) IsWGReady() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.wgReady
+}
+
 func (w *WGTunnel) Start() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -102,21 +109,20 @@ func (w *WGTunnel) Start() error {
 	w.device = device
 	w.deviceName = device.Name()
 
-	// Real WireGuard kernel setup (platform-specific)
-	if path, err := exec.LookPath("wg"); err == nil {
-		w.wgPath = path
-		ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort, w.wgPath)
+	// Configure real WireGuard (platform-specific via routes_linux/darwin/windows.go)
+	if checkWGAvailable() {
+		ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort)
 		if err != nil {
-			fmt.Printf("[WARN] wg set interface failed: %v\n", err)
+			fmt.Printf("[WARN] wg set interface failed: %v — falling back to raw TUN\n", err)
 		} else if ready {
 			w.wgReady = true
-			fmt.Printf("[INFO] WireGuard active on %s\n", w.deviceName)
+			fmt.Printf("[INFO] WireGuard active on %s (listen-port %d)\n", w.deviceName, w.listenPort)
 		}
 	} else {
-		fmt.Println("[WARN] wireguard-tools not installed — raw TUN mode (ICMP only)")
+		fmt.Println("[WARN] wireguard-tools (wg) not installed — install with: sudo apt install wireguard-tools")
 	}
 
-	enableIPForwarding(w.deviceName)
+	enableIPForwarding()
 	maskBits, _ := maskBitsFromCIDR(w.cidr)
 	subnetCIDR := fmt.Sprintf("%s/%d", networkAddr(w.virtualIP, maskBits), maskBits)
 	_ = addSubnetRoute(subnetCIDR, w.deviceName)
@@ -149,15 +155,17 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 	now := time.Now().UTC()
 	w.peers[publicKey] = &PeerConfig{
 		PublicKey:     publicKey,
-		Endpoint:     endpoint,
-		AllowedIP:    allowedIP,
-		AddedAt:      now,
+		Endpoint:      endpoint,
+		AllowedIP:     allowedIP,
+		AddedAt:       now,
 		LastHandshake: now,
 	}
 	w.stats.LastHandshake = now
 
 	if w.wgReady {
-		_ = addWGPeer(w.deviceName, publicKey, endpoint, allowedIP, w.wgPath)
+		if err := addWGPeer(w.deviceName, publicKey, endpoint, allowedIP); err != nil {
+			fmt.Printf("[WARN] add wg peer failed: %v\n", err)
+		}
 	}
 
 	peerIP := strings.Split(allowedIP, "/")[0]
@@ -181,7 +189,7 @@ func (w *WGTunnel) RemovePeer(publicKey string) error {
 	}
 
 	if w.wgReady {
-		_ = removeWGPeer(w.deviceName, publicKey, w.wgPath)
+		_ = removeWGPeer(w.deviceName, publicKey)
 	}
 
 	peerIP := strings.Split(peer.AllowedIP, "/")[0]
@@ -206,7 +214,7 @@ func (w *WGTunnel) UpdatePeerEndpoint(publicKey, newEndpoint string) error {
 	w.stats.LastHandshake = peer.LastHandshake
 
 	if w.wgReady {
-		_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint, w.wgPath)
+		_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint)
 	}
 	return nil
 }
@@ -215,12 +223,6 @@ func (w *WGTunnel) GetStats() TunnelStats {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.stats
-}
-
-func (w *WGTunnel) CIDR() string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return w.cidr
 }
 
 func (w *WGTunnel) RecordRX(bytes uint64) {
@@ -244,7 +246,7 @@ func (w *WGTunnel) Stop() error {
 
 	for pubKey, peer := range w.peers {
 		if w.wgReady {
-			_ = removeWGPeer(w.deviceName, pubKey, w.wgPath)
+			_ = removeWGPeer(w.deviceName, pubKey)
 		}
 		peerIP := strings.Split(peer.AllowedIP, "/")[0]
 		_ = removeHostRoute(peerIP, w.deviceName)
