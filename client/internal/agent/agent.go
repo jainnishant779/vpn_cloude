@@ -349,6 +349,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
 	wgPort := maxInt(a.config.WGListenPort, 51820)
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
@@ -385,6 +386,7 @@ func (a *Agent) sendHeartbeat() error {
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
+	wgPort := maxInt(a.config.WGListenPort, 51820)
 	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if peerID == "" {
