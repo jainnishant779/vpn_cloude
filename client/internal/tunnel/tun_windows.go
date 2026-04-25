@@ -6,7 +6,10 @@ package tunnel
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"net"
 	"net"
 	"os/exec"
 	"strconv"
@@ -29,15 +32,22 @@ type WindowsTUNDevice struct {
 	name    string
 }
 
-func (d *WindowsTUNDevice) Create(name string, mtu int) error {
+func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	if mtu <= 0 {
 		mtu = 1420
 	}
+
+	logW("TUN", "Creating wintun adapter '%s' MTU=%d", name, mtu)
+
+	// Kill any stale adapter first
+	killStaleAdapter(name)
+
 	tunDev, err := tun.CreateTUN(name, mtu)
 	if err != nil {
 		return fmt.Errorf("windows tun create: create device: %w", err)
 	}
-	resolvedName, err := tunDev.Name()
+
+	realName, err := tunDev.Name()
 	if err != nil {
 		_ = tunDev.Close()
 		return fmt.Errorf("windows tun create: read name: %w", err)
@@ -175,6 +185,8 @@ func (d *WindowsTUNDevice) Close() error {
 	if d.uapiLn != nil {
 		_ = d.uapiLn.Close()
 	}
+
+	// Close WG device
 	if d.wgDev != nil {
 		d.wgDev.Close()
 		d.wgDev = nil
@@ -213,15 +225,56 @@ func ConfigureTUN(name, ip, cidr string) error {
 	return nil
 }
 
-func SetMTU(name string, mtu int) error {
-	return runNetsh("interface", "ipv4", "set", "subinterface",
-		name, "mtu="+strconv.Itoa(mtu), "store=active")
+func (d *WindowsTUNDevice) enableAdapter() {
+	_ = exec.Command("powershell", "-Command",
+		fmt.Sprintf("Enable-NetAdapter -Name '%s' -Confirm:$false -ErrorAction SilentlyContinue", d.name)).Run()
+	time.Sleep(200 * time.Millisecond)
 }
 
-func DestroyTUN(name string) error {
-	_ = runNetsh("interface", "set", "interface", "name="+name, "admin=disabled")
-	return nil
-}
+func (d *WindowsTUNDevice) setIPAddress(ip, cidr string) error {
+	bits := cidrToBits(cidr)
+
+	// Method 1: PowerShell New-NetIPAddress (most reliable)
+	logW("CFG", "Method 1: PowerShell Set IP %s/%d on %s", ip, bits, d.name)
+	psCmd := fmt.Sprintf(
+		"$a = Get-NetAdapter -Name '%s' -ErrorAction Stop; "+
+			"Remove-NetIPAddress -InterfaceIndex $a.ifIndex -Confirm:$false -ErrorAction SilentlyContinue; "+
+			"Remove-NetRoute -InterfaceIndex $a.ifIndex -Confirm:$false -ErrorAction SilentlyContinue; "+
+			"New-NetIPAddress -InterfaceIndex $a.ifIndex -IPAddress '%s' -PrefixLength %d -PolicyStore ActiveStore -ErrorAction Stop",
+		d.name, ip, bits)
+
+	out, err := exec.Command("powershell", "-Command", psCmd).CombinedOutput()
+	if err == nil {
+		logW("CFG", "IP set via PowerShell OK")
+		return nil
+	}
+	logW("CFG", "PowerShell failed: %s", strings.TrimSpace(string(out)))
+
+	// Method 2: netsh
+	logW("CFG", "Method 2: netsh")
+	mask := bitsToNetmask(bits)
+	for i := 0; i < 5; i++ {
+		out, err := exec.Command("netsh", "interface", "ip", "set", "address",
+			fmt.Sprintf("name=%s", d.name), "source=static",
+			fmt.Sprintf("addr=%s", ip), fmt.Sprintf("mask=%s", mask)).CombinedOutput()
+		if err == nil {
+			logW("CFG", "IP set via netsh OK (attempt %d)", i+1)
+			return nil
+		}
+		logW("CFG", "netsh attempt %d: %s", i+1, strings.TrimSpace(string(out)))
+		time.Sleep(1 * time.Second)
+	}
+
+	// Method 3: netsh add (instead of set)
+	logW("CFG", "Method 3: netsh add")
+	out, err = exec.Command("netsh", "interface", "ip", "add", "address",
+		fmt.Sprintf("name=%s", d.name),
+		fmt.Sprintf("addr=%s", ip),
+		fmt.Sprintf("mask=%s", mask)).CombinedOutput()
+	if err == nil {
+		logW("CFG", "IP set via netsh add OK")
+		return nil
+	}
 
 func runNetsh(args ...string) error {
 	out, err := exec.Command("netsh", args...).CombinedOutput()

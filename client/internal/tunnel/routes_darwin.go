@@ -6,75 +6,89 @@ package tunnel
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
-func enableIPForwarding(deviceName string) {
-	_ = exec.Command("sh", "-c", "sysctl -w net.inet.ip.forwarding=1").Run()
-}
-
-func addSubnetRoute(networkCIDR, deviceName string) error {
-	cmd := fmt.Sprintf("route -n add -net %s -interface %s 2>/dev/null || true", networkCIDR, deviceName)
-	return runWGCmd("add subnet route", cmd)
-}
-
-func addHostRoute(peerIP, deviceName string) error {
-	cmd := fmt.Sprintf("route -n add -host %s -interface %s 2>/dev/null || true", peerIP, deviceName)
-	return runWGCmd("add peer route", cmd)
-}
-
-func removeHostRoute(peerIP, deviceName string) error {
-	cmd := fmt.Sprintf("route -n delete -host %s 2>/dev/null || true", peerIP)
-	return runWGCmd("remove peer route", cmd)
-}
-
-func runWGCmd(description, command string) error {
-	out, err := exec.Command("sh", "-c", command).CombinedOutput()
-	if err != nil {
-		fmt.Printf("[WARN] %s failed: %s — %v\n", description, strings.TrimSpace(string(out)), err)
-		return err
-	}
-	return nil
-}
-
-func configureWG(deviceName, privateKey string, listenPort int, wgPath string) (bool, error) {
-	if wgPath == "" {
-		wgPath = "wg"
-	}
-	cmd := exec.Command(wgPath, "set", deviceName,
-		"listen-port", fmt.Sprintf("%d", listenPort),
-		"private-key", "/dev/stdin")
+func configureWG(ifName, privateKey string, listenPort int) (bool, error) {
+	cmd := exec.Command("wg", "set", ifName,
+		"private-key", "/dev/stdin",
+		"listen-port", fmt.Sprintf("%d", listenPort))
 	cmd.Stdin = strings.NewReader(privateKey)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return false, fmt.Errorf("%s — %v", strings.TrimSpace(string(out)), err)
+		return false, fmt.Errorf("wg set: %s: %w", string(out), err)
 	}
 	return true, nil
 }
 
-func addWGPeer(deviceName, publicKey, endpoint, allowedIP string, wgPath string) error {
-	if wgPath == "" {
-		wgPath = "wg"
+func addWGPeer(ifName, publicKey, endpoint, allowedIP string) error {
+	args := []string{"set", ifName, "peer", publicKey, "allowed-ips", allowedIP}
+	if endpoint != "" {
+		args = append(args, "endpoint", endpoint)
 	}
-	cmd := fmt.Sprintf(
-		"%s set %s peer %s endpoint %s allowed-ips %s persistent-keepalive 25",
-		wgPath, deviceName, publicKey, endpoint, allowedIP,
-	)
-	return runWGCmd("add wg peer", cmd)
+	args = append(args, "persistent-keepalive", "25")
+	out, err := exec.Command("wg", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("wg set peer: %s: %w", string(out), err)
+	}
+	return nil
 }
 
-func removeWGPeer(deviceName, publicKey string, wgPath string) error {
-	if wgPath == "" {
-		wgPath = "wg"
+func removeWGPeer(ifName, publicKey string) error {
+	out, err := exec.Command("wg", "set", ifName, "peer", publicKey, "remove").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("wg remove: %s: %w", string(out), err)
 	}
-	cmd := fmt.Sprintf("%s set %s peer %s remove", wgPath, deviceName, publicKey)
-	return runWGCmd("remove wg peer", cmd)
+	return nil
 }
 
-func updateWGPeerEndpoint(deviceName, publicKey, endpoint string, wgPath string) error {
-	if wgPath == "" {
-		wgPath = "wg"
+func updateWGPeerEndpoint(ifName, publicKey, endpoint string) error {
+	out, err := exec.Command("wg", "set", ifName, "peer", publicKey, "endpoint", endpoint).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("wg update: %s: %w", string(out), err)
 	}
-	cmd := fmt.Sprintf("%s set %s peer %s endpoint %s", wgPath, deviceName, publicKey, endpoint)
-	return runWGCmd("update peer endpoint", cmd)
+	return nil
+}
+
+func enableIPForwarding() {
+	_ = exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
+}
+
+func addSubnetRoute(cidr, ifName string) error {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid cidr: %s", cidr)
+	}
+	out, err := exec.Command("route", "-n", "add", "-net", cidr, "-interface", ifName).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "exists") {
+		return fmt.Errorf("add subnet route: %s: %w", string(out), err)
+	}
+	return nil
+}
+
+func addHostRoute(ip, ifName string) error {
+	out, err := exec.Command("route", "-n", "add", "-host", ip, "-interface", ifName).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "exists") {
+		return fmt.Errorf("add host route: %s: %w", string(out), err)
+	}
+	return nil
+}
+
+func removeHostRoute(ip, ifName string) error {
+	_ = exec.Command("route", "-n", "delete", "-host", ip).Run()
+	return nil
+}
+
+func maskBitsFromCIDR(cidr string) (int, error) {
+	parts := strings.Split(cidr, "/")
+	if len(parts) == 2 {
+		if bits, err := strconv.Atoi(parts[1]); err == nil {
+			return bits, nil
+		}
+	}
+	if bits, err := strconv.Atoi(cidr); err == nil {
+		return bits, nil
+	}
+	return 24, nil
 }
