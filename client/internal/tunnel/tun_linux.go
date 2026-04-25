@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 type LinuxTUNDevice struct {
@@ -15,7 +16,6 @@ type LinuxTUNDevice struct {
 
 func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	_ = exec.Command("ip", "link", "delete", name).Run()
-
 	if err := exec.Command("ip", "link", "add", name, "type", "wireguard").Run(); err != nil {
 		return nil, fmt.Errorf("ip link add: %w", err)
 	}
@@ -28,10 +28,23 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 func (d *LinuxTUNDevice) Name() string { return d.name }
 
 func (d *LinuxTUNDevice) Configure(ip, cidr string) error {
-	addr := ip + "/" + cidr
+	// cidr can be "16", "/16", or "10.7.0.0/16"
+	// We need just the prefix length bits
+	prefixLen := "24" // default
+	if strings.Contains(cidr, "/") {
+		parts := strings.Split(cidr, "/")
+		prefixLen = parts[len(parts)-1]
+	} else {
+		// cidr is just the number like "16"
+		prefixLen = cidr
+	}
+
+	addr := ip + "/" + prefixLen
+	fmt.Printf("[TUN] ip addr add %s dev %s\n", addr, d.name)
+
 	out, err := exec.Command("ip", "addr", "add", addr, "dev", d.name).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ip addr add %s: %s: %w", addr, string(out), err)
+		return fmt.Errorf("ip addr add %s: %s: %w", addr, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
