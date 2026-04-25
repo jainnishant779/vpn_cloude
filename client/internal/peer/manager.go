@@ -31,7 +31,7 @@ type PeerManager struct {
 	peers       map[string]*PeerConnection
 	networkID   string
 	localPeerID string
-	memberID    string // ZeroTier mode
+	memberID    string
 
 	handshakeSecret []byte
 
@@ -62,7 +62,6 @@ func NewPeerManager(
 	}
 }
 
-// SetMemberID enables ZeroTier-style peer fetching.
 func (m *PeerManager) SetMemberID(memberID string) {
 	m.memberID = memberID
 }
@@ -104,7 +103,6 @@ func (m *PeerManager) Stop() error {
 	return nil
 }
 
-// fetchPeers uses member token if available, else API key.
 func (m *PeerManager) fetchPeers() ([]api_client.PeerInfo, error) {
 	if m.memberID != "" {
 		return m.apiClient.MemberGetPeers(m.memberID)
@@ -138,7 +136,6 @@ func (m *PeerManager) syncPeersOnce() error {
 			continue
 		}
 
-		// Update endpoint if changed
 		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints, m.tunnel.CIDR())
 		if newEndpoint != "" && newEndpoint != existing.Endpoint {
 			_ = m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint)
@@ -157,7 +154,6 @@ func (m *PeerManager) syncPeersOnce() error {
 		}
 	}
 
-	// Remove peers that went offline
 	m.mu.RLock()
 	existingIDs := make([]string, 0, len(m.peers))
 	for peerID := range m.peers {
@@ -174,81 +170,69 @@ func (m *PeerManager) syncPeersOnce() error {
 	return nil
 }
 
-<<<<<<< HEAD
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
-	// 1. Check if any local endpoint is on the same subnet as us (same LAN)
 	addrs, _ := net.InterfaceAddrs()
 	_, tunNet, _ := net.ParseCIDR(tunCIDR)
 
+	// Priority 1: Same LAN subnet
 	for _, ep := range localEndpoints {
-		peerHost, _, err := net.SplitHostPort(ep)
+		peerHost, peerPort, err := net.SplitHostPort(ep)
 		if err != nil {
 			peerHost = ep
+			peerPort = "51820"
 		}
 		peerIP := net.ParseIP(peerHost)
 		if peerIP == nil || peerIP.To4() == nil {
 			continue
 		}
-		
-		// Avoid routing loop by ignoring peers claiming IP addresses in the tunnel virtual subnet
+		if strings.HasPrefix(peerHost, "169.254.") || peerHost == "127.0.0.1" {
+			continue
+		}
 		if tunNet != nil && tunNet.Contains(peerIP) {
 			continue
 		}
-		
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				// Simple /24 subnet match for LAN detection
-				if ipnet.IP.To4()[0] == peerIP.To4()[0] && ipnet.IP.To4()[1] == peerIP.To4()[1] && ipnet.IP.To4()[2] == peerIP.To4()[2] {
-					if !strings.Contains(ep, ":") {
-						return ep + ":51820"
+				if ipnet.Contains(peerIP) {
+					if peerPort == "" {
+						peerPort = "51820"
 					}
-					return ep
+					return net.JoinHostPort(peerHost, peerPort)
 				}
-=======
-// preferIPv4 selects best endpoint: LAN IP first, then public IP with WireGuard port.
-func preferIPv4(publicEndpoint string, localEndpoints []string) string {
-	myAddrs, _ := net.InterfaceAddrs()
-
-	// Priority 1: Same subnet (LAN) - avoids NAT hairpin issues
-	for _, ep := range localEndpoints {
-		host, port, err := net.SplitHostPort(ep)
-		if err != nil { host = ep; port = "51820" }
-		peerIP := net.ParseIP(host)
-		if peerIP == nil || peerIP.To4() == nil { continue }
-		if strings.HasPrefix(host, "169.254.") || host == "127.0.0.1" { continue }
-		for _, addr := range myAddrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil { continue }
-			if ipnet.Contains(peerIP) {
-				if port == "" { port = "51820" }
-				return net.JoinHostPort(host, port)
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 			}
 		}
 	}
 
-<<<<<<< HEAD
-	// 2. Check if public endpoint is IPv4 (not bracketed IPv6)
-=======
 	// Priority 2: Any private RFC1918 local endpoint
 	for _, ep := range localEndpoints {
 		host, port, err := net.SplitHostPort(ep)
-		if err != nil { host = ep; port = "51820" }
+		if err != nil {
+			host = ep
+			port = "51820"
+		}
 		peerIP := net.ParseIP(host)
-		if peerIP == nil || peerIP.To4() == nil { continue }
-		if strings.HasPrefix(host, "169.254.") { continue }
-		s := host
-		isPrivate := strings.HasPrefix(s, "10.") || strings.HasPrefix(s, "192.168.") ||
-			(len(s) >= 7 && s[:7] >= "172.16." && s[:7] <= "172.31.")
+		if peerIP == nil || peerIP.To4() == nil {
+			continue
+		}
+		if strings.HasPrefix(host, "169.254.") {
+			continue
+		}
+		if tunNet != nil && tunNet.Contains(peerIP) {
+			continue
+		}
+		isPrivate := strings.HasPrefix(host, "10.") ||
+			strings.HasPrefix(host, "192.168.") ||
+			(len(host) >= 4 && strings.HasPrefix(host, "172."))
 		if isPrivate {
-			if port == "" { port = "51820" }
+			if port == "" {
+				port = "51820"
+			}
 			return net.JoinHostPort(host, port)
 		}
 	}
 
-	// Priority 3: Public endpoint - always use port 51820
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
+	// Priority 3: Public endpoint with port 51820
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
 		host, _, err := net.SplitHostPort(publicEndpoint)
 		if err == nil {
@@ -269,11 +253,9 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 		return fmt.Errorf("connect to peer: tunnel is nil")
 	}
 
-	// Get best endpoint — prefer IPv4
 	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints, m.tunnel.CIDR())
 	connectedVia := "direct"
 
-	// If no endpoint at all, try relay
 	if endpoint == "" {
 		if m.apiClient != nil {
 			relayInfo, err := m.apiClient.GetNearestRelay(peer.ID)
@@ -284,7 +266,6 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 		}
 	}
 
-	// Still no endpoint — skip for now, will retry on next sync
 	if endpoint == "" {
 		return fmt.Errorf("connect to peer: no endpoint available for %s", peer.Name)
 	}
