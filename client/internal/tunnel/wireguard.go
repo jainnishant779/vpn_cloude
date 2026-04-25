@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,7 @@ type WGTunnel struct {
 	listenPort int
 	deviceName string
 	mtu        int
-	wgReady    bool // true when real WireGuard (kernel or userspace) is configured
+	wgReady    bool
 
 	mu      sync.RWMutex
 	started bool
@@ -52,6 +53,9 @@ func networkAddr(ip string, maskBits int) string {
 }
 
 func checkWGAvailable() bool {
+	if runtime.GOOS == "windows" {
+		return true // Windows uses in-process wireguard-go
+	}
 	_, err := exec.LookPath("wg")
 	return err == nil
 }
@@ -83,8 +87,6 @@ func NewWGTunnel(privateKey, virtualIP, cidr string, listenPort int) (*WGTunnel,
 	}, nil
 }
 
-// IsWGReady returns true if real WireGuard (kernel or userspace) is active.
-// When false, the agent falls back to raw TUN packet forwarding.
 func (w *WGTunnel) IsWGReady() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -106,25 +108,39 @@ func (w *WGTunnel) Start() error {
 		_ = device.Close()
 		return fmt.Errorf("wg tunnel start: configure tun: %w", err)
 	}
-	w.device = device
+	w.device     = device
 	w.deviceName = device.Name()
 
-	// Configure real WireGuard (platform-specific via routes_linux/darwin/windows.go)
-	if checkWGAvailable() {
-		ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort)
-		if err != nil {
-			fmt.Printf("[WARN] wg set interface failed: %v — falling back to raw TUN\n", err)
-		} else if ready {
-			w.wgReady = true
-			fmt.Printf("[INFO] WireGuard active on %s (listen-port %d)\n", w.deviceName, w.listenPort)
+	// ── Windows: use in-process wireguard-go ─────────────────────────────────
+	if runtime.GOOS == "windows" {
+		if winDev, ok := device.(*WindowsTUNDevice); ok {
+			if err := winDev.SetupWireGuard(w.privateKey, w.listenPort); err != nil {
+				fmt.Printf("[WARN] WireGuard setup failed: %v — raw TUN mode\n", err)
+			} else {
+				w.wgReady = true
+				fmt.Printf("[INFO] WireGuard active in-process on %s (port %d)\n",
+					w.deviceName, w.listenPort)
+			}
 		}
 	} else {
-		fmt.Println("[WARN] wireguard-tools (wg) not installed — install with: sudo apt install wireguard-tools")
+		// ── Linux/macOS: use wg command + kernel module ───────────────────────
+		if checkWGAvailable() {
+			ready, err := configureWG(w.deviceName, w.privateKey, w.listenPort)
+			if err != nil {
+				fmt.Printf("[WARN] wg set failed: %v — raw TUN mode\n", err)
+			} else if ready {
+				w.wgReady = true
+				fmt.Printf("[INFO] WireGuard kernel mode on %s (port %d)\n",
+					w.deviceName, w.listenPort)
+			}
+		} else {
+			fmt.Println("[WARN] wireguard-tools (wg) not installed — install: sudo apt install wireguard-tools")
+		}
 	}
 
 	enableIPForwarding()
 	maskBits, _ := maskBitsFromCIDR(w.cidr)
-	subnetCIDR := fmt.Sprintf("%s/%d", networkAddr(w.virtualIP, maskBits), maskBits)
+	subnetCIDR   := fmt.Sprintf("%s/%d", networkAddr(w.virtualIP, maskBits), maskBits)
 	_ = addSubnetRoute(subnetCIDR, w.deviceName)
 
 	w.started = true
@@ -136,41 +152,40 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.started {
-		return fmt.Errorf("add peer: tunnel is not started")
+		return fmt.Errorf("add peer: tunnel not started")
 	}
-	if strings.TrimSpace(publicKey) == "" {
-		return fmt.Errorf("add peer: public key is required")
+	if strings.TrimSpace(publicKey) == "" || strings.TrimSpace(endpoint) == "" || strings.TrimSpace(allowedIP) == "" {
+		return fmt.Errorf("add peer: publicKey, endpoint and allowedIP are required")
 	}
-	if strings.TrimSpace(endpoint) == "" {
-		return fmt.Errorf("add peer: endpoint is required")
-	}
-	if strings.TrimSpace(allowedIP) == "" {
-		return fmt.Errorf("add peer: allowed ip is required")
-	}
-
 	if !strings.Contains(allowedIP, "/") {
 		allowedIP += "/32"
 	}
 
 	now := time.Now().UTC()
 	w.peers[publicKey] = &PeerConfig{
-		PublicKey:     publicKey,
-		Endpoint:      endpoint,
-		AllowedIP:     allowedIP,
-		AddedAt:       now,
-		LastHandshake: now,
+		PublicKey: publicKey, Endpoint: endpoint,
+		AllowedIP: allowedIP, AddedAt: now, LastHandshake: now,
 	}
 	w.stats.LastHandshake = now
 
 	if w.wgReady {
-		if err := addWGPeer(w.deviceName, publicKey, endpoint, allowedIP); err != nil {
-			fmt.Printf("[WARN] add wg peer failed: %v\n", err)
+		if runtime.GOOS == "windows" {
+			// Windows: use in-process wireguard-go
+			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
+				if err := winDev.AddWGPeer(publicKey, endpoint, allowedIP); err != nil {
+					fmt.Printf("[WARN] add wg peer (windows): %v\n", err)
+				}
+			}
+		} else {
+			// Linux/macOS: use wg command
+			if err := addWGPeer(w.deviceName, publicKey, endpoint, allowedIP); err != nil {
+				fmt.Printf("[WARN] add wg peer: %v\n", err)
+			}
 		}
 	}
 
 	peerIP := strings.Split(allowedIP, "/")[0]
 	_ = addHostRoute(peerIP, w.deviceName)
-
 	return nil
 }
 
@@ -178,23 +193,25 @@ func (w *WGTunnel) RemovePeer(publicKey string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.started {
-		return fmt.Errorf("remove peer: tunnel is not started")
-	}
-	if strings.TrimSpace(publicKey) == "" {
-		return fmt.Errorf("remove peer: public key is required")
+		return fmt.Errorf("remove peer: tunnel not started")
 	}
 	peer, exists := w.peers[publicKey]
 	if !exists {
-		return fmt.Errorf("remove peer: peer not found")
+		return fmt.Errorf("remove peer: not found")
 	}
 
 	if w.wgReady {
-		_ = removeWGPeer(w.deviceName, publicKey)
+		if runtime.GOOS == "windows" {
+			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
+				_ = winDev.RemoveWGPeer(publicKey)
+			}
+		} else {
+			_ = removeWGPeer(w.deviceName, publicKey)
+		}
 	}
 
 	peerIP := strings.Split(peer.AllowedIP, "/")[0]
 	_ = removeHostRoute(peerIP, w.deviceName)
-
 	delete(w.peers, publicKey)
 	return nil
 }
@@ -203,18 +220,24 @@ func (w *WGTunnel) UpdatePeerEndpoint(publicKey, newEndpoint string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.started {
-		return fmt.Errorf("update peer endpoint: tunnel is not started")
+		return fmt.Errorf("update peer endpoint: tunnel not started")
 	}
 	peer, exists := w.peers[publicKey]
 	if !exists {
-		return fmt.Errorf("update peer endpoint: peer not found")
+		return fmt.Errorf("update peer endpoint: not found")
 	}
 	peer.Endpoint = newEndpoint
 	peer.LastHandshake = time.Now().UTC()
 	w.stats.LastHandshake = peer.LastHandshake
 
 	if w.wgReady {
-		_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint)
+		if runtime.GOOS == "windows" {
+			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
+				_ = winDev.AddWGPeer(publicKey, newEndpoint, peer.AllowedIP)
+			}
+		} else {
+			_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint)
+		}
 	}
 	return nil
 }
@@ -225,17 +248,8 @@ func (w *WGTunnel) GetStats() TunnelStats {
 	return w.stats
 }
 
-func (w *WGTunnel) RecordRX(bytes uint64) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.stats.RXBytes += bytes
-}
-
-func (w *WGTunnel) RecordTX(bytes uint64) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.stats.TXBytes += bytes
-}
+func (w *WGTunnel) RecordRX(bytes uint64) { w.mu.Lock(); w.stats.RXBytes += bytes; w.mu.Unlock() }
+func (w *WGTunnel) RecordTX(bytes uint64) { w.mu.Lock(); w.stats.TXBytes += bytes; w.mu.Unlock() }
 
 func (w *WGTunnel) Stop() error {
 	w.mu.Lock()
@@ -243,22 +257,20 @@ func (w *WGTunnel) Stop() error {
 	if !w.started {
 		return nil
 	}
-
 	for pubKey, peer := range w.peers {
-		if w.wgReady {
+		if w.wgReady && runtime.GOOS != "windows" {
 			_ = removeWGPeer(w.deviceName, pubKey)
 		}
 		peerIP := strings.Split(peer.AllowedIP, "/")[0]
 		_ = removeHostRoute(peerIP, w.deviceName)
 	}
-
 	if w.device != nil {
 		if err := w.device.Close(); err != nil {
-			return fmt.Errorf("wg tunnel stop: close tun device: %w", err)
+			return fmt.Errorf("wg tunnel stop: %w", err)
 		}
 	}
-	w.device = nil
-	w.peers = make(map[string]*PeerConfig)
+	w.device  = nil
+	w.peers   = make(map[string]*PeerConfig)
 	w.started = false
 	w.wgReady = false
 	return nil
@@ -300,13 +312,13 @@ func (w *WGTunnel) FindEndpointByVirtualIP(destIP string) (string, bool) {
 	return "", false
 }
 
-func validateWireGuardKey(privateKey string) error {
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privateKey))
+func validateWireGuardKey(key string) error {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
 	if err != nil {
 		return fmt.Errorf("validate key: decode base64: %w", err)
 	}
 	if len(decoded) != 32 {
-		return fmt.Errorf("validate key: expected 32-byte key material")
+		return fmt.Errorf("validate key: expected 32 bytes, got %d", len(decoded))
 	}
 	return nil
 }

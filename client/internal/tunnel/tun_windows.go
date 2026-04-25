@@ -1,149 +1,17 @@
-<<<<<<< HEAD
 //go:build windows
 // +build windows
 
 package tunnel
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
-	"os/exec"
-	"strconv"
-
-	"golang.zx2c4.com/wireguard/tun"
-)
-
-// WindowsTUNDevice wraps wireguard-go tun device for Windows.
-type WindowsTUNDevice struct {
-	dev  tun.Device
-	name string
-}
-
-func (d *WindowsTUNDevice) Create(name string, mtu int) error {
-	if mtu <= 0 {
-		mtu = 1420
-	}
-
-	dev, err := tun.CreateTUN(name, mtu)
-	if err != nil {
-		return fmt.Errorf("windows tun create: create device: %w", err)
-	}
-
-	resolvedName, err := dev.Name()
-	if err != nil {
-		_ = dev.Close()
-		return fmt.Errorf("windows tun create: read name: %w", err)
-	}
-
-	d.dev = dev
-	d.name = resolvedName
-	return nil
-}
-
-func (d *WindowsTUNDevice) Configure(ip string, cidr string) error {
-	if d.name == "" {
-		return fmt.Errorf("windows tun configure: interface is not created")
-	}
-	return ConfigureTUN(d.name, ip, cidr)
-}
-
-func (d *WindowsTUNDevice) Read(buf []byte) (int, error) {
-	if d.dev == nil {
-		return 0, fmt.Errorf("windows tun read: device is not created")
-	}
-
-	packets := [][]byte{buf}
-	sizes := make([]int, 1)
-	_, err := d.dev.Read(packets, sizes, 0)
-	if err != nil {
-		return 0, fmt.Errorf("windows tun read: %w", err)
-	}
-	return sizes[0], nil
-}
-
-func (d *WindowsTUNDevice) Write(buf []byte) (int, error) {
-	if d.dev == nil {
-		return 0, fmt.Errorf("windows tun write: device is not created")
-	}
-
-	if _, err := d.dev.Write([][]byte{buf}, 0); err != nil {
-		return 0, fmt.Errorf("windows tun write: %w", err)
-	}
-	return len(buf), nil
-}
-
-func (d *WindowsTUNDevice) Close() error {
-	if d.dev == nil {
-		return nil
-	}
-	if err := d.dev.Close(); err != nil {
-		return fmt.Errorf("windows tun close: %w", err)
-	}
-	return nil
-}
-
-func (d *WindowsTUNDevice) Name() string {
-	return d.name
-}
-
-func CreateTUN(name string, mtu int) (TUNDevice, error) {
-	device := &WindowsTUNDevice{}
-	if err := device.Create(name, mtu); err != nil {
-		return nil, fmt.Errorf("create tun: %w", err)
-	}
-	return device, nil
-}
-
-func ConfigureTUN(name string, ip string, cidr string) error {
-	mask, err := maskStringFromCIDR(cidr)
-	if err != nil {
-		return fmt.Errorf("configure tun: derive mask: %w", err)
-	}
-
-	if err := runNetsh("interface", "ip", "set", "address", name, "static", ip, mask); err != nil {
-		return fmt.Errorf("configure tun: set ipv4 address: %w", err)
-	}
-	return nil
-}
-
-func SetMTU(name string, mtu int) error {
-	if mtu <= 0 {
-		return fmt.Errorf("set mtu: mtu must be positive")
-	}
-	if err := runNetsh("interface", "ipv4", "set", "subinterface", name, "mtu="+strconv.Itoa(mtu), "store=active"); err != nil {
-		return fmt.Errorf("set mtu: %w", err)
-	}
-	return nil
-}
-
-func DestroyTUN(name string) error {
-	if name == "" {
-		return fmt.Errorf("destroy tun: name is required")
-	}
-	if err := runNetsh("interface", "set", "interface", "name="+name, "admin=disabled"); err != nil {
-		return fmt.Errorf("destroy tun: disable interface: %w", err)
-	}
-	return nil
-}
-
-func runNetsh(args ...string) error {
-	cmd := exec.Command("netsh", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("run netsh %v: %w (output: %s)", args, err, string(output))
-	}
-	return nil
-}
-=======
-//go:build windows
-// +build windows
-
-package tunnel
-
-import (
-	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -151,10 +19,13 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+// WindowsTUNDevice wraps wireguard-go for Windows using wintun + in-process WG device.
+// This gives full kernel-level WireGuard without needing wg.exe to work.
 type WindowsTUNDevice struct {
-	dev     tun.Device
+	mu      sync.Mutex
+	tunDev  tun.Device
 	wgDev   *device.Device
-	uapiSrv *ipc.UAPIListener
+	uapiLn  net.Listener
 	name    string
 }
 
@@ -164,112 +35,161 @@ func (d *WindowsTUNDevice) Create(name string, mtu int) error {
 	}
 	tunDev, err := tun.CreateTUN(name, mtu)
 	if err != nil {
-		return fmt.Errorf("windows tun create: %w", err)
+		return fmt.Errorf("windows tun create: create device: %w", err)
 	}
 	resolvedName, err := tunDev.Name()
 	if err != nil {
 		_ = tunDev.Close()
-		return fmt.Errorf("windows tun name: %w", err)
+		return fmt.Errorf("windows tun create: read name: %w", err)
 	}
-	d.dev  = tunDev
-	d.name = resolvedName
+	d.tunDev = tunDev
+	d.name   = resolvedName
 	return nil
 }
 
-func (d *WindowsTUNDevice) Configure(ip string, cidr string) error {
+func (d *WindowsTUNDevice) Configure(ip, cidr string) error {
 	if d.name == "" {
-		return fmt.Errorf("windows tun configure: not created")
+		return fmt.Errorf("windows tun configure: interface not created")
 	}
 	return ConfigureTUN(d.name, ip, cidr)
 }
 
-func (d *WindowsTUNDevice) SetupWireGuard(privateKey string, listenPort int) error {
-	if d.dev == nil {
-		return fmt.Errorf("tun device not created")
+// SetupWireGuard initialises the in-process WireGuard device.
+// Called by wireguard.go after Start() to configure private key + listen port.
+// This replaces the external wg.exe approach — everything runs in-process.
+func (d *WindowsTUNDevice) SetupWireGuard(privateKeyB64 string, listenPort int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.tunDev == nil {
+		return fmt.Errorf("setup wireguard: tun device not created")
 	}
-	logger := device.NewLogger(device.LogLevelError, "[quicktunnel] ")
-	wgDev := device.NewDevice(d.dev, conn.NewDefaultBind(), logger)
 
-	// Configure via IPC (same protocol as wg set)
-	ipcConf := fmt.Sprintf("private_key=%s\nlisten_port=%d\n",
-		keyToHex(privateKey), listenPort)
+	privKeyHex, err := b64ToHex(privateKeyB64)
+	if err != nil {
+		return fmt.Errorf("setup wireguard: parse private key: %w", err)
+	}
 
+	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("[%s] ", d.name))
+	wgDev  := device.NewDevice(d.tunDev, conn.NewDefaultBind(), logger)
+
+	ipcConf := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", privKeyHex, listenPort)
 	if err := wgDev.IpcSet(ipcConf); err != nil {
 		wgDev.Close()
-		return fmt.Errorf("wg ipc set: %w", err)
+		return fmt.Errorf("setup wireguard: ipc set: %w", err)
 	}
-
 	if err := wgDev.Up(); err != nil {
 		wgDev.Close()
-		return fmt.Errorf("wg device up: %w", err)
+		return fmt.Errorf("setup wireguard: device up: %w", err)
 	}
 
 	d.wgDev = wgDev
 
-	// Start UAPI listener so wg.exe can also communicate
-	uapi, err := ipc.UAPIListen(d.name)
+	// Start UAPI listener so wg.exe can also read interface state
+	uapiLn, err := ipc.UAPIListen(d.name)
 	if err == nil {
-		d.uapiSrv, _ = uapi.(*ipc.UAPIListener)
+		d.uapiLn = uapiLn
 		go func() {
 			for {
-				c, err := uapi.Accept()
+				conn, err := uapiLn.Accept()
 				if err != nil {
 					return
 				}
-				go wgDev.IpcHandle(c)
+				go wgDev.IpcHandle(conn)
 			}
 		}()
 	}
+
 	return nil
 }
 
-func (d *WindowsTUNDevice) AddWGPeer(publicKey, endpoint, allowedIP string) error {
+// AddWGPeer adds a WireGuard peer in-process (no wg.exe needed).
+func (d *WindowsTUNDevice) AddWGPeer(publicKeyB64, endpoint, allowedIP string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if d.wgDev == nil {
-		return fmt.Errorf("wireguard not initialized")
+		return fmt.Errorf("add wg peer: wireguard not initialized")
+	}
+
+	pubKeyHex, err := b64ToHex(publicKeyB64)
+	if err != nil {
+		return fmt.Errorf("add wg peer: parse public key: %w", err)
 	}
 	if !strings.Contains(allowedIP, "/") {
 		allowedIP += "/32"
 	}
-	conf := fmt.Sprintf("public_key=%s\nendpoint=%s\nallowed_ip=%s\npersistent_keepalive_interval=25\n",
-		keyToHex(publicKey), endpoint, allowedIP)
-	return d.wgDev.IpcSet(conf)
+
+	ipcConf := fmt.Sprintf(
+		"public_key=%s\nendpoint=%s\nallowed_ip=%s\npersistent_keepalive_interval=25\n",
+		pubKeyHex, endpoint, allowedIP,
+	)
+	if err := d.wgDev.IpcSet(ipcConf); err != nil {
+		return fmt.Errorf("add wg peer: ipc set: %w", err)
+	}
+	return nil
+}
+
+// RemoveWGPeer removes a WireGuard peer in-process.
+func (d *WindowsTUNDevice) RemoveWGPeer(publicKeyB64 string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.wgDev == nil {
+		return nil
+	}
+	pubKeyHex, err := b64ToHex(publicKeyB64)
+	if err != nil {
+		return fmt.Errorf("remove wg peer: parse public key: %w", err)
+	}
+	return d.wgDev.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", pubKeyHex))
 }
 
 func (d *WindowsTUNDevice) Read(buf []byte) (int, error) {
-	if d.dev == nil {
-		return 0, fmt.Errorf("device not created")
+	if d.tunDev == nil {
+		return 0, fmt.Errorf("windows tun read: device not created")
 	}
 	packets := [][]byte{buf}
 	sizes   := make([]int, 1)
-	_, err  := d.dev.Read(packets, sizes, 0)
+	_, err  := d.tunDev.Read(packets, sizes, 0)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("windows tun read: %w", err)
 	}
 	return sizes[0], nil
 }
 
 func (d *WindowsTUNDevice) Write(buf []byte) (int, error) {
-	if d.dev == nil {
-		return 0, fmt.Errorf("device not created")
+	if d.tunDev == nil {
+		return 0, fmt.Errorf("windows tun write: device not created")
 	}
-	_, err := d.dev.Write([][]byte{buf}, 0)
-	return len(buf), err
+	if _, err := d.tunDev.Write([][]byte{buf}, 0); err != nil {
+		return 0, fmt.Errorf("windows tun write: %w", err)
+	}
+	return len(buf), nil
 }
 
 func (d *WindowsTUNDevice) Close() error {
-	if d.uapiSrv != nil {
-		_ = d.uapiSrv.Close()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.uapiLn != nil {
+		_ = d.uapiLn.Close()
 	}
 	if d.wgDev != nil {
 		d.wgDev.Close()
+		d.wgDev = nil
 	}
-	if d.dev != nil {
-		return d.dev.Close()
+	if d.tunDev != nil {
+		err := d.tunDev.Close()
+		d.tunDev = nil
+		return err
 	}
 	return nil
 }
 
 func (d *WindowsTUNDevice) Name() string { return d.name }
+
+// ── TUNDevice interface ──────────────────────────────────────────────────────
 
 func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	dev := &WindowsTUNDevice{}
@@ -279,7 +199,9 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	return dev, nil
 }
 
-func ConfigureTUN(name string, ip string, cidr string) error {
+// ── Windows-specific helpers ─────────────────────────────────────────────────
+
+func ConfigureTUN(name, ip, cidr string) error {
 	mask, err := maskStringFromCIDR(cidr)
 	if err != nil {
 		return fmt.Errorf("configure tun: derive mask: %w", err)
@@ -303,21 +225,21 @@ func DestroyTUN(name string) error {
 
 func runNetsh(args ...string) error {
 	out, err := exec.Command("netsh", args...).CombinedOutput()
-	if err != nil {
+	if err != nil && !strings.Contains(string(out), "exists") && !strings.Contains(string(out), "already") {
 		return fmt.Errorf("netsh %v: %w (out: %s)", args, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// keyToHex converts a base64 WireGuard key to lowercase hex (IPC format).
-func keyToHex(b64key string) string {
-	import_b64 := strings.TrimSpace(b64key)
-	_ = import_b64
-	// Use wireguard key parsing
-	var key device.NoisePrivateKey
-	if err := key.FromMaybeZeroHex(b64key); err == nil {
-		return fmt.Sprintf("%x", key)
+// b64ToHex converts a base64-encoded 32-byte WireGuard key to lowercase hex.
+// WireGuard's IPC protocol (UAPI) requires hex-encoded keys.
+func b64ToHex(b64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		return "", fmt.Errorf("b64ToHex: decode: %w", err)
 	}
-	return b64key
+	if len(raw) != 32 {
+		return "", fmt.Errorf("b64ToHex: expected 32 bytes, got %d", len(raw))
+	}
+	return hex.EncodeToString(raw), nil
 }
->>>>>>> 1a6e92bd1e0d9da692521f9a66ee50afe11ed600
