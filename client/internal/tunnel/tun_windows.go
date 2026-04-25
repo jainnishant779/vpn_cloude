@@ -481,8 +481,13 @@ func b64ToHex(b64 string) (string, error) {
 }
 
 func cidrToBits(cidr string) int {
-	s := strings.TrimPrefix(cidr, "/")
-	bits, err := strconv.Atoi(s)
+	// Handle formats: "16", "/16", "10.7.0.0/16"
+	if strings.Contains(cidr, "/") {
+		parts := strings.Split(cidr, "/")
+		cidr = parts[len(parts)-1]
+	}
+	cidr = strings.TrimPrefix(cidr, "/")
+	bits, err := strconv.Atoi(cidr)
 	if err != nil || bits <= 0 || bits > 32 {
 		return 24
 	}
