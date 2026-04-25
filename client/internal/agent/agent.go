@@ -29,7 +29,6 @@ const (
 	maxReconnectBackoff    = 2 * time.Minute
 )
 
-// Agent orchestrates tunnel, peer connectivity, and local VNC status.
 type Agent struct {
 	config      *config.Config
 	apiClient   *api_client.Client
@@ -158,10 +157,6 @@ func (a *Agent) Start() error {
 	// ── WireGuard tunnel ──────────────────────────────────────────────────────
 	wgPort := maxInt(a.config.WGListenPort, 51820)
 	var err error
-<<<<<<< HEAD
-=======
-	wgPort := maxInt(a.config.WGListenPort, 51820)
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, wgPort)
 	if err != nil {
 		return fmt.Errorf("agent start: create tunnel: %w", err)
@@ -170,40 +165,22 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("agent start: start tunnel: %w", err)
 	}
 
-	// ── Hole puncher (for relay fallback + NAT traversal) ────────────────────
-	// Use port 0 (random) — WireGuard owns the real port
+	// ── Hole puncher ─────────────────────────────────────────────────────────
 	a.holePuncher, err = nat.NewHolePuncher(0)
 	if err != nil {
-		// Non-fatal: relay fallback won't work but tunnel still functions
 		log.Warn().Err(err).Msg("agent start: create hole puncher failed (non-fatal)")
 	}
 
 	// ── Endpoint discovery ────────────────────────────────────────────────────
-	// CRITICAL FIX: Announce WireGuard's actual listen port, not the STUN socket port.
-	// The STUN socket uses a random port — WireGuard listens on wgPort.
-	// We discover the public IP via STUN but always pair it with wgPort.
 	a.state.Set(StateDiscovering)
-<<<<<<< HEAD
 	publicIP, _, stunErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
 	if stunErr != nil {
-		// Fallback: try to get public IP from local interfaces
 		publicIP = getOutboundIP()
 		if publicIP == "" {
 			log.Warn().Err(stunErr).Msg("agent start: STUN discovery failed — using loopback")
 			publicIP = "127.0.0.1"
 		}
 	}
-	// Use WireGuard's configured listen port so peers connect to the right port
-=======
-	publicIP, _, stunDiscoverErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
-	if stunDiscoverErr != nil {
-		publicIP = netutil.GetOutboundIP()
-		if publicIP == "" {
-			publicIP = "127.0.0.1"
-		}
-	}
-	// CRITICAL: always use WireGuard listen port (51820), NOT the STUN socket port
->>>>>>> 74e04af0d3a2a2cc71dbc1789ea446fcce0660c4
 	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(wgPort))
 
 	a.mu.Lock()
@@ -217,25 +194,12 @@ func (a *Agent) Start() error {
 		Msg("endpoint discovered")
 
 	// ── Announce endpoint ─────────────────────────────────────────────────────
-	localIPs := netutil.GetLocalIPs()
-	// Also add local IPs with WireGuard port for LAN direct connection
-	localIPsWithPort := make([]string, 0, len(localIPs))
-	for _, ip := range localIPs {
-		host, _, err := net.SplitHostPort(ip)
-		if err != nil {
-			host = ip
-		}
-		localIPsWithPort = append(localIPsWithPort, net.JoinHostPort(host, strconv.Itoa(wgPort)))
-	}
+	localIPsWithPort := getLocalIPsWithPort(wgPort)
 
 	if useMemberToken {
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
-<<<<<<< HEAD
 			LocalEndpoints: localIPsWithPort,
-=======
-			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
@@ -244,11 +208,7 @@ func (a *Agent) Start() error {
 			PeerID:         peerID,
 			NetworkID:      a.config.NetworkID,
 			PublicEndpoint: endpoint,
-<<<<<<< HEAD
 			LocalEndpoints: localIPsWithPort,
-=======
-			LocalEndpoints: localIPsWithPort(netutil.GetLocalIPs(), wgPort),
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		}); err != nil {
 			log.Warn().Err(err).Msg("announce failed (non-fatal)")
 		}
@@ -276,10 +236,6 @@ func (a *Agent) Start() error {
 	}
 	a.peerMgr.Start()
 
-	// CRITICAL FIX: Only start raw packet forwarding when WireGuard kernel/userspace
-	// mode is NOT active. With real WireGuard, the kernel handles ALL packet I/O —
-	// calling startPacketForwarding causes a CPU-spinning busy loop because
-	// LinuxWGDevice.Read() returns (0, nil) and never blocks.
 	if !a.tunnel.IsWGReady() {
 		log.Warn().Msg("WireGuard not ready — using raw TUN packet forwarding (ICMP only, TCP/UDP limited)")
 		a.startPacketForwarding()
@@ -368,22 +324,17 @@ func (a *Agent) heartbeatLoop(useMemberToken bool) {
 
 func (a *Agent) sendMemberHeartbeat() error {
 	a.mu.RLock()
-	memberID  := a.memberID
-	endpoint  := a.publicEndpoint
-	vncAvail  := a.vncAvailable
-	wgPort    := maxInt(a.config.WGListenPort, 51820)
+	memberID := a.memberID
+	endpoint := a.publicEndpoint
+	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
+
 	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
 	}
 
-<<<<<<< HEAD
-	// Re-discover public IP (handles IP changes) but keep WireGuard port
-=======
-	// Refresh public endpoint
->>>>>>> 74e04af0d3a2a2cc71dbc1789ea446fcce0660c4
 	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
 		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
 		if fresh != endpoint {
@@ -413,8 +364,8 @@ func (a *Agent) sendHeartbeat() error {
 	peerID   := a.peerID
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
-	wgPort   := maxInt(a.config.WGListenPort, 51820)
 	a.mu.RUnlock()
+
 	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if peerID == "" {
@@ -495,10 +446,6 @@ func (a *Agent) qualityMonitorLoop() {
 	}
 }
 
-// startPacketForwarding runs the raw TUN data plane.
-// Only called when real WireGuard (kernel or userspace) is NOT available.
-// With real WireGuard, the kernel handles all packet I/O — calling this
-// would cause a 100% CPU busy loop.
 func (a *Agent) startPacketForwarding() {
 	if a.holePuncher == nil {
 		return
@@ -509,7 +456,6 @@ func (a *Agent) startPacketForwarding() {
 	}
 	magic := []byte{0x51, 0x54, 0x44, 0x54}
 
-	// outbound: TUN → UDP
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -523,7 +469,6 @@ func (a *Agent) startPacketForwarding() {
 			n, err := a.tunnel.ReadPacket(buf)
 			if err != nil || n < 20 {
 				if n == 0 {
-					// Avoid busy loop — sleep briefly when no data
 					time.Sleep(1 * time.Millisecond)
 				}
 				continue
@@ -544,7 +489,6 @@ func (a *Agent) startPacketForwarding() {
 		}
 	}()
 
-	// inbound: UDP → TUN
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -621,7 +565,6 @@ func isLocalPortOpen(port int) bool {
 	return true
 }
 
-// getOutboundIP returns the device's outbound IP by connecting to a public DNS.
 func getOutboundIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
@@ -635,19 +578,10 @@ func getOutboundIP() string {
 	return addr.IP.String()
 }
 
-<<<<<<< HEAD
-// getLocalIPsWithPort returns local IPs with the given port appended.
 func getLocalIPsWithPort(port int) []string {
 	raw := netutil.GetLocalIPs()
 	result := make([]string, 0, len(raw))
 	for _, ip := range raw {
-=======
-// localIPsWithPort appends the given port to each local IP.
-// This ensures peers connect to the WireGuard port (51820), not a random port.
-func localIPsWithPort(ips []string, port int) []string {
-	result := make([]string, 0, len(ips))
-	for _, ip := range ips {
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27
 		host, _, err := net.SplitHostPort(ip)
 		if err != nil {
 			host = ip
@@ -655,8 +589,4 @@ func localIPsWithPort(ips []string, port int) []string {
 		result = append(result, net.JoinHostPort(host, strconv.Itoa(port)))
 	}
 	return result
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> 91700f6385828200369dbdd7345eaad063a90c27

@@ -92,3 +92,12 @@ func maskBitsFromCIDR(cidr string) (int, error) {
 	}
 	return 24, nil
 }
+
+func maskStringFromCIDR(cidr string) (string, error) {
+	bits, err := maskBitsFromCIDR(cidr)
+	if err != nil {
+		return "255.255.255.0", nil
+	}
+	m := uint32(0xFFFFFFFF) << (32 - bits)
+	return fmt.Sprintf("%d.%d.%d.%d", m>>24&0xFF, m>>16&0xFF, m>>8&0xFF, m&0xFF), nil
+}

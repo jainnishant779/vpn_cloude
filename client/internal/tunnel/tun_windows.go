@@ -296,3 +296,22 @@ func b64ToHex(b64 string) (string, error) {
 	}
 	return hex.EncodeToString(raw), nil
 }
+
+func cidrToBits(cidr string) int {
+	s := strings.TrimPrefix(cidr, "/")
+	bits, err := strconv.Atoi(s)
+	if err != nil || bits <= 0 || bits > 32 {
+		return 24
+	}
+	return bits
+}
+
+func bitsToNetmask(bits int) string {
+	m := uint32(0xFFFFFFFF) << (32 - bits)
+	return fmt.Sprintf("%d.%d.%d.%d", m>>24&0xFF, m>>16&0xFF, m>>8&0xFF, m&0xFF)
+}
+
+func logW(tag, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("[WIN-%s] %s\n", tag, msg)
+}
