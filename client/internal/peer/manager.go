@@ -189,7 +189,7 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 		if strings.HasPrefix(peerHost, "169.254.") || peerHost == "127.0.0.1" {
 			continue
 		}
-		if tunNet != nil && tunNet.Contains(peerIP) {
+		if tunNet == nil || !tunNet.Contains(peerIP) {
 			continue
 		}
 		for _, addr := range addrs {
