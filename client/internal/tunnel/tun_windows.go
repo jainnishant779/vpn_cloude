@@ -6,10 +6,7 @@ package tunnel
 import (
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
-	"net"
 	"net"
 	"os/exec"
 	"strconv"
@@ -298,7 +295,14 @@ func b64ToHex(b64 string) (string, error) {
 }
 
 func cidrToBits(cidr string) int {
-	s := strings.TrimPrefix(cidr, "/")
+	// cidr can be "16", "/16", or "10.7.0.0/16"
+	// Extract prefix length from any format
+	s := cidr
+	if strings.Contains(cidr, "/") {
+		parts := strings.Split(cidr, "/")
+		s = parts[len(parts)-1]
+	}
+	s = strings.TrimPrefix(s, "/")
 	bits, err := strconv.Atoi(s)
 	if err != nil || bits <= 0 || bits > 32 {
 		return 24
