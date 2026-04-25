@@ -310,3 +310,6 @@ func validateWireGuardKey(privateKey string) error {
 	}
 	return nil
 }
+func (w *WGTunnel) CIDR() string {
+	return w.cidr
+}
