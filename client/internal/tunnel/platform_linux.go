@@ -1,5 +1,5 @@
-//go:build darwin
-// +build darwin
+//go:build linux
+// +build linux
 
 package tunnel
 
@@ -52,31 +52,27 @@ func updateWGPeerEndpoint(ifName, publicKey, endpoint string) error {
 }
 
 func enableIPForwarding() {
-	_ = exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
+	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 }
 
 func addSubnetRoute(cidr, ifName string) error {
-	parts := strings.Split(cidr, "/")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid cidr: %s", cidr)
-	}
-	out, err := exec.Command("route", "-n", "add", "-net", cidr, "-interface", ifName).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "exists") {
+	out, err := exec.Command("ip", "route", "add", cidr, "dev", ifName).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "File exists") {
 		return fmt.Errorf("add subnet route: %s: %w", string(out), err)
 	}
 	return nil
 }
 
 func addHostRoute(ip, ifName string) error {
-	out, err := exec.Command("route", "-n", "add", "-host", ip, "-interface", ifName).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "exists") {
+	out, err := exec.Command("ip", "route", "add", ip+"/32", "dev", ifName).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "File exists") {
 		return fmt.Errorf("add host route: %s: %w", string(out), err)
 	}
 	return nil
 }
 
 func removeHostRoute(ip, ifName string) error {
-	_ = exec.Command("route", "-n", "delete", "-host", ip).Run()
+	_ = exec.Command("ip", "route", "del", ip+"/32", "dev", ifName).Run()
 	return nil
 }
 
