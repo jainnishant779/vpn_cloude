@@ -363,7 +363,13 @@ func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
 	if m.apiClient == nil {
 		return "", fmt.Errorf("api client is nil")
 	}
-	relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peerID)
+	var relayInfo *api_client.RelayInfo
+	var err error
+	if m.memberID != "" {
+		relayInfo, err = m.apiClient.MemberGetNearestRelay(m.memberID, m.networkID, peerID)
+	} else {
+		relayInfo, err = m.apiClient.GetNearestRelay(m.networkID, peerID)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -407,7 +413,13 @@ func (m *PeerManager) ForceRelay(peerID string) error {
 	if !exists {
 		return fmt.Errorf("force relay: peer not connected")
 	}
-	relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peerID)
+	var relayInfo *api_client.RelayInfo
+	var err error
+	if m.memberID != "" {
+		relayInfo, err = m.apiClient.MemberGetNearestRelay(m.memberID, m.networkID, peerID)
+	} else {
+		relayInfo, err = m.apiClient.GetNearestRelay(m.networkID, peerID)
+	}
 	if err != nil {
 		return fmt.Errorf("force relay: assign relay: %w", err)
 	}
@@ -477,3 +489,4 @@ func splitHostPort(endpoint string) (string, int, error) {
 	}
 	return host, port, nil
 }
+

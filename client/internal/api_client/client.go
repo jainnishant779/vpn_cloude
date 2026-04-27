@@ -238,6 +238,22 @@ func (c *Client) GetNearestRelay(networkID, peerID string) (*RelayInfo, error) {
 	return &out, nil
 }
 
+// MemberGetNearestRelay requests relay fallback assignment for a peer using member token.
+func (c *Client) MemberGetNearestRelay(memberID, networkID, targetPeerID string) (*RelayInfo, error) {
+	query := url.Values{}
+	if strings.TrimSpace(networkID) != "" {
+		query.Set("network_id", networkID)
+	}
+	query.Set("peer_id", targetPeerID)
+	path := fmt.Sprintf("/api/v1/members/%s/relay?", url.PathEscape(memberID)) + query.Encode()
+
+	var out RelayInfo
+	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authMemberToken, &out); err != nil {
+		return nil, fmt.Errorf("member get nearest relay: %w", err)
+	}
+	return &out, nil
+}
+
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, authMode requestAuthMode, responseTarget any) error {
 	fullURL := c.baseURL + path
 
