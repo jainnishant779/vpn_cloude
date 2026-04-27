@@ -4,16 +4,23 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"quicktunnel/server/internal/config"
 )
 
 type RelayAssignment struct {
+	PeerID        string `json:"peer_id"`
+	RelayID       string `json:"relay_id"`
+	RelayHost     string `json:"relay_host"`
+	RelayPort     int    `json:"relay_port"`
+	Token         string `json:"token"`
+	Region        string `json:"region"`
 	RelayEndpoint string `json:"relay_endpoint"`
 	SessionToken  string `json:"session_token"`
 	ExpiresAt     int64  `json:"expires_at"`
@@ -23,16 +30,28 @@ type RelayAssignment struct {
 // Handler for GET /api/v1/coord/relay/assign
 func RelayAssignHandler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		networkID := r.URL.Query().Get("network_id")
-		peerID := r.URL.Query().Get("peer_id")
-		if networkID == "" || peerID == "" {
-			http.Error(w, "missing network_id or peer_id", http.StatusBadRequest)
+		networkID := strings.TrimSpace(r.URL.Query().Get("network_id"))
+		peerID := strings.TrimSpace(r.URL.Query().Get("peer_id"))
+		if peerID == "" {
+			http.Error(w, "missing peer_id", http.StatusBadRequest)
 			return
 		}
 		relayEndpoint := os.Getenv("RELAY_ENDPOINT")
 		if relayEndpoint == "" {
-			relayEndpoint = "relay:3478" // fallback
+			relayEndpoint = "relay:3478"
 		}
+		relayHost := relayEndpoint
+		relayPort := 3478
+		if host, portStr, err := net.SplitHostPort(relayEndpoint); err == nil {
+			relayHost = host
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
+				relayPort = p
+			}
+		}
+		if networkID == "" {
+			networkID = "default"
+		}
+
 		expiresAt := time.Now().Add(5 * time.Minute).Unix()
 		secret := cfg.RelaySessionSecret
 		if secret == "" {
@@ -44,12 +63,17 @@ func RelayAssignHandler(cfg *config.Config) http.HandlerFunc {
 		h.Write([]byte(msg))
 		token := hex.EncodeToString(h.Sum(nil))
 		resp := RelayAssignment{
+			PeerID:        peerID,
+			RelayID:       "relay-default",
+			RelayHost:     relayHost,
+			RelayPort:     relayPort,
+			Token:         token,
+			Region:        "default",
 			RelayEndpoint: relayEndpoint,
 			SessionToken:  token,
 			ExpiresAt:     expiresAt,
 			NetworkID:     networkID,
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		writeSuccess(w, http.StatusOK, resp)
 	}
 }

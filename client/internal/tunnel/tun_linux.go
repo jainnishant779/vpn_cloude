@@ -16,8 +16,16 @@ type LinuxTUNDevice struct {
 
 func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	_ = exec.Command("ip", "link", "delete", name).Run()
-	if err := exec.Command("ip", "link", "add", name, "type", "wireguard").Run(); err != nil {
-		return nil, fmt.Errorf("ip link add: %w", err)
+
+	// Best-effort kernel module load for devices where it is not auto-loaded.
+	_ = exec.Command("modprobe", "wireguard").Run()
+
+	if out, err := exec.Command("ip", "link", "add", name, "type", "wireguard").CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if strings.Contains(msg, "Operation not supported") || strings.Contains(msg, "Unknown device type") {
+			return nil, fmt.Errorf("ip link add: %s: wireguard kernel support missing; install wireguard and load module (`sudo modprobe wireguard`)", msg)
+		}
+		return nil, fmt.Errorf("ip link add: %s: %w", msg, err)
 	}
 	if err := exec.Command("ip", "link", "set", name, "mtu", strconv.Itoa(mtu), "up").Run(); err != nil {
 		return nil, fmt.Errorf("ip link set: %w", err)

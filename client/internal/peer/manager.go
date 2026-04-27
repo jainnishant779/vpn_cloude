@@ -189,7 +189,8 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 		if strings.HasPrefix(peerHost, "169.254.") || peerHost == "127.0.0.1" {
 			continue
 		}
-		if tunNet == nil || !tunNet.Contains(peerIP) {
+		// Ignore local endpoints that are actually tunnel addresses.
+		if tunNet != nil && tunNet.Contains(peerIP) {
 			continue
 		}
 		for _, addr := range addrs {
@@ -223,7 +224,7 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 		}
 		isPrivate := strings.HasPrefix(host, "10.") ||
 			strings.HasPrefix(host, "192.168.") ||
-			(len(host) >= 4 && strings.HasPrefix(host, "172."))
+			isPrivate172(host)
 		if isPrivate {
 			if port == "" {
 				port = "51820"
@@ -258,7 +259,7 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 
 	if endpoint == "" {
 		if m.apiClient != nil {
-			relayInfo, err := m.apiClient.GetNearestRelay(peer.ID)
+			relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peer.ID)
 			if err == nil {
 				endpoint = net.JoinHostPort(relayInfo.RelayHost, strconv.Itoa(relayInfo.RelayPort))
 				connectedVia = "relay"
@@ -330,7 +331,7 @@ func (m *PeerManager) ForceRelay(peerID string) error {
 	if !exists {
 		return fmt.Errorf("force relay: peer not connected")
 	}
-	relayInfo, err := m.apiClient.GetNearestRelay(peerID)
+	relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peerID)
 	if err != nil {
 		return fmt.Errorf("force relay: assign relay: %w", err)
 	}
@@ -399,4 +400,16 @@ func splitHostPort(endpoint string) (string, int, error) {
 		return "", 0, fmt.Errorf("split host port: port out of range")
 	}
 	return host, port, nil
+}
+
+func isPrivate172(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 || parts[0] != "172" {
+		return false
+	}
+	second, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return second >= 16 && second <= 31
 }

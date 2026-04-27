@@ -223,8 +223,11 @@ func (c *Client) Announce(endpoint AnnounceRequest) error {
 }
 
 // GetNearestRelay requests relay fallback assignment for a peer.
-func (c *Client) GetNearestRelay(peerID string) (*RelayInfo, error) {
+func (c *Client) GetNearestRelay(networkID, peerID string) (*RelayInfo, error) {
 	query := url.Values{}
+	if strings.TrimSpace(networkID) != "" {
+		query.Set("network_id", networkID)
+	}
 	query.Set("peer_id", peerID)
 	path := "/api/v1/coord/relay/assign?" + query.Encode()
 
