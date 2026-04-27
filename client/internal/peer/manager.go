@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"quicktunnel/client/internal/nat"
 	"quicktunnel/client/internal/tunnel"
 )
+
+const defaultPeerSyncInterval = 15 * time.Second
 
 type PeerConnection struct {
 	PeerID       string
@@ -39,6 +42,8 @@ type PeerManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	syncInterval time.Duration
 }
 
 func NewPeerManager(
@@ -59,11 +64,21 @@ func NewPeerManager(
 		handshakeSecret: []byte("quicktunnel-handshake-secret"),
 		ctx:             ctx,
 		cancel:          cancel,
+		syncInterval:    defaultPeerSyncInterval,
 	}
 }
 
 func (m *PeerManager) SetMemberID(memberID string) {
 	m.memberID = memberID
+}
+
+func (m *PeerManager) SetSyncInterval(d time.Duration) {
+	if d < 10*time.Second {
+		d = 10 * time.Second
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.syncInterval = d
 }
 
 func (m *PeerManager) Start() {
@@ -72,7 +87,11 @@ func (m *PeerManager) Start() {
 		defer m.wg.Done()
 		_ = m.syncPeersOnce()
 
-		ticker := time.NewTicker(15 * time.Second)
+		m.mu.RLock()
+		interval := m.syncInterval
+		m.mu.RUnlock()
+
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {
@@ -139,6 +158,15 @@ func (m *PeerManager) syncPeersOnce() error {
 		}
 
 		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints, m.tunnel.CIDR())
+		newConnectedVia := "p2p"
+		if newEndpoint == "" {
+			relayEndpoint, err := m.resolveRelayEndpoint(peerInfo.ID)
+			if err == nil && relayEndpoint != "" {
+				newEndpoint = relayEndpoint
+				newConnectedVia = "relay"
+			}
+		}
+
 		if newEndpoint != "" && newEndpoint != existing.Endpoint {
 			if err := m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint); err != nil {
 				fmt.Printf("[PEER] endpoint update failed peer=%s (%s): %v\n", peerInfo.Name, peerInfo.ID, err)
@@ -146,6 +174,7 @@ func (m *PeerManager) syncPeersOnce() error {
 			m.mu.Lock()
 			if conn, ok := m.peers[peerInfo.ID]; ok {
 				conn.Endpoint = newEndpoint
+				conn.ConnectedVia = newConnectedVia
 				conn.LastSeen = time.Now().UTC()
 			}
 			m.mu.Unlock()
@@ -176,21 +205,53 @@ func (m *PeerManager) syncPeersOnce() error {
 
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
-	// Priority 1: Public endpoint with WireGuard listen port.
-	// This is the safest default across NATed networks.
-	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
-		host, _, err := net.SplitHostPort(publicEndpoint)
-		if err == nil {
-			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-				return net.JoinHostPort(host, "51820")
-			}
-		}
-		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
-			return net.JoinHostPort(publicEndpoint, "51820")
-		}
+	if endpoint := normalizePublicEndpoint(publicEndpoint); endpoint != "" {
+		return endpoint
 	}
 
-	// Priority 2: Same-LAN local endpoint fallback (only when no public endpoint).
+	// Optional LAN fallback. Disabled by default because many networks reuse the
+	// same private subnets (for example 192.168.x.x), which can cause false
+	// "same-lan" matches and break WireGuard handshake.
+	if !lanFallbackEnabled() {
+		return ""
+	}
+
+	return preferLANEndpoint(localEndpoints, tunCIDR)
+}
+
+func normalizePublicEndpoint(publicEndpoint string) string {
+	publicEndpoint = strings.TrimSpace(publicEndpoint)
+	if publicEndpoint == "" {
+		return ""
+	}
+
+	host, port, err := net.SplitHostPort(publicEndpoint)
+	if err == nil {
+		host = strings.TrimSpace(host)
+		port = strings.TrimSpace(port)
+		if port == "" {
+			port = "51820"
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if !isRoutableIPv4(ip) {
+				return ""
+			}
+			return net.JoinHostPort(ip.String(), port)
+		}
+		// Hostname endpoint. Keep announced port as-is.
+		return net.JoinHostPort(host, port)
+	}
+
+	if ip := net.ParseIP(publicEndpoint); ip != nil {
+		if !isRoutableIPv4(ip) {
+			return ""
+		}
+		return net.JoinHostPort(ip.String(), "51820")
+	}
+	return ""
+}
+
+func preferLANEndpoint(localEndpoints []string, tunCIDR string) string {
 	addrs, _ := net.InterfaceAddrs()
 	_, tunNet, _ := net.ParseCIDR(tunCIDR)
 	for _, ep := range localEndpoints {
@@ -221,21 +282,49 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 	return ""
 }
 
+func lanFallbackEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("QT_ENABLE_LAN_ENDPOINT_FALLBACK")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+func isRoutableIPv4(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ip.IsPrivate() {
+		return false
+	}
+	// Link-local 169.254.0.0/16
+	if v4[0] == 169 && v4[1] == 254 {
+		return false
+	}
+	// Carrier-grade NAT 100.64.0.0/10
+	if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	return true
+}
+
 func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 	if m.tunnel == nil {
 		return fmt.Errorf("connect to peer: tunnel is nil")
 	}
 
 	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints, m.tunnel.CIDR())
-	connectedVia := "direct"
+	connectedVia := "p2p"
 
 	if endpoint == "" {
-		if m.apiClient != nil {
-			relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peer.ID)
-			if err == nil {
-				endpoint = net.JoinHostPort(relayInfo.RelayHost, strconv.Itoa(relayInfo.RelayPort))
-				connectedVia = "relay"
-			}
+		relayEndpoint, err := m.resolveRelayEndpoint(peer.ID)
+		if err != nil {
+			return fmt.Errorf("connect to peer: resolve relay endpoint: %w", err)
+		}
+		if relayEndpoint != "" {
+			endpoint = relayEndpoint
+			connectedVia = "relay"
 		}
 	}
 
@@ -268,6 +357,21 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 	m.mu.Unlock()
 
 	return nil
+}
+
+func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
+	if m.apiClient == nil {
+		return "", fmt.Errorf("api client is nil")
+	}
+	relayInfo, err := m.apiClient.GetNearestRelay(m.networkID, peerID)
+	if err != nil {
+		return "", err
+	}
+	host := strings.TrimSpace(relayInfo.RelayHost)
+	if host == "" || relayInfo.RelayPort <= 0 {
+		return "", fmt.Errorf("invalid relay endpoint")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(relayInfo.RelayPort)), nil
 }
 
 func (m *PeerManager) disconnectPeer(peerID string) error {

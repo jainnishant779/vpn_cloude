@@ -20,6 +20,11 @@ type Config struct {
 	WGListenPort int    `json:"wg_listen_port"`
 	STUNServer   string `json:"stun_server"`
 
+	HeartbeatIntervalSec       int `json:"heartbeat_interval_sec,omitempty"`
+	PeerSyncIntervalSec        int `json:"peer_sync_interval_sec,omitempty"`
+	EndpointRefreshIntervalSec int `json:"endpoint_refresh_interval_sec,omitempty"`
+	QualityMonitorIntervalSec  int `json:"quality_monitor_interval_sec,omitempty"`
+
 	Email    string `json:"email,omitempty"`
 	Password string `json:"password,omitempty"`
 
@@ -37,6 +42,10 @@ func defaultConfig() *Config {
 		LogLevel:     "info",
 		WGListenPort: 51820,
 		STUNServer:   "stun.l.google.com:19302",
+		HeartbeatIntervalSec:       30,
+		PeerSyncIntervalSec:        15,
+		EndpointRefreshIntervalSec: 60,
+		QualityMonitorIntervalSec:  60,
 	}
 }
 
@@ -92,6 +101,18 @@ func applyEnvOverrides(cfg *Config) {
 	if v := env("STUN_SERVER"); v != "" { cfg.STUNServer = v }
 	if v := env("WG_LISTEN_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil { cfg.WGListenPort = n }
+	}
+	if v := env("HEARTBEAT_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil { cfg.HeartbeatIntervalSec = n }
+	}
+	if v := env("PEER_SYNC_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil { cfg.PeerSyncIntervalSec = n }
+	}
+	if v := env("ENDPOINT_REFRESH_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil { cfg.EndpointRefreshIntervalSec = n }
+	}
+	if v := env("QUALITY_MONITOR_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil { cfg.QualityMonitorIntervalSec = n }
 	}
 }
 

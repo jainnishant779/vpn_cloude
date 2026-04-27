@@ -260,6 +260,10 @@ approved:
 		LogLevel:     "info",
 		WGListenPort: 51820,
 		STUNServer:   "stun.l.google.com:19302",
+		HeartbeatIntervalSec:       30,
+		PeerSyncIntervalSec:        15,
+		EndpointRefreshIntervalSec: 60,
+		QualityMonitorIntervalSec:  60,
 		MemberID:     jr.MemberID,
 		MemberToken:  jr.MemberToken,
 		WGPrivateKey: privKey,
@@ -487,6 +491,22 @@ func runConfig(args []string) error {
 			case "wg_listen_port":
 				if n, err := strconv.Atoi(v); err == nil {
 					cfg.WGListenPort = n
+				}
+			case "heartbeat_interval_sec":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.HeartbeatIntervalSec = n
+				}
+			case "peer_sync_interval_sec":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.PeerSyncIntervalSec = n
+				}
+			case "endpoint_refresh_interval_sec":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.EndpointRefreshIntervalSec = n
+				}
+			case "quality_monitor_interval_sec":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.QualityMonitorIntervalSec = n
 				}
 			}
 		}

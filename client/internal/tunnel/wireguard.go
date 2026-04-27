@@ -161,6 +161,27 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 		allowedIP += "/32"
 	}
 
+	if w.wgReady {
+		if runtime.GOOS == "windows" {
+			// Windows: use in-process wireguard-go
+			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
+				if err := winDev.AddWGPeer(publicKey, endpoint, allowedIP); err != nil {
+					return fmt.Errorf("add peer: windows wg peer: %w", err)
+				}
+			}
+		} else {
+			// Linux/macOS: use wg command
+			if err := addWGPeer(w.deviceName, publicKey, endpoint, allowedIP); err != nil {
+				return fmt.Errorf("add peer: wg set peer: %w", err)
+			}
+		}
+	}
+
+	peerIP := strings.Split(allowedIP, "/")[0]
+	if err := addHostRoute(peerIP, w.deviceName); err != nil {
+		return fmt.Errorf("add peer: add host route: %w", err)
+	}
+
 	now := time.Now().UTC()
 	w.peers[publicKey] = &PeerConfig{
 		PublicKey: publicKey, Endpoint: endpoint,
@@ -168,24 +189,6 @@ func (w *WGTunnel) AddPeer(publicKey, endpoint, allowedIP string) error {
 	}
 	w.stats.LastHandshake = now
 
-	if w.wgReady {
-		if runtime.GOOS == "windows" {
-			// Windows: use in-process wireguard-go
-			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
-				if err := winDev.AddWGPeer(publicKey, endpoint, allowedIP); err != nil {
-					fmt.Printf("[WARN] add wg peer (windows): %v\n", err)
-				}
-			}
-		} else {
-			// Linux/macOS: use wg command
-			if err := addWGPeer(w.deviceName, publicKey, endpoint, allowedIP); err != nil {
-				fmt.Printf("[WARN] add wg peer: %v\n", err)
-			}
-		}
-	}
-
-	peerIP := strings.Split(allowedIP, "/")[0]
-	_ = addHostRoute(peerIP, w.deviceName)
 	return nil
 }
 
@@ -203,15 +206,21 @@ func (w *WGTunnel) RemovePeer(publicKey string) error {
 	if w.wgReady {
 		if runtime.GOOS == "windows" {
 			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
-				_ = winDev.RemoveWGPeer(publicKey)
+				if err := winDev.RemoveWGPeer(publicKey); err != nil {
+					return fmt.Errorf("remove peer: windows wg remove: %w", err)
+				}
 			}
 		} else {
-			_ = removeWGPeer(w.deviceName, publicKey)
+			if err := removeWGPeer(w.deviceName, publicKey); err != nil {
+				return fmt.Errorf("remove peer: wg remove: %w", err)
+			}
 		}
 	}
 
 	peerIP := strings.Split(peer.AllowedIP, "/")[0]
-	_ = removeHostRoute(peerIP, w.deviceName)
+	if err := removeHostRoute(peerIP, w.deviceName); err != nil {
+		return fmt.Errorf("remove peer: remove host route: %w", err)
+	}
 	delete(w.peers, publicKey)
 	return nil
 }
@@ -226,19 +235,24 @@ func (w *WGTunnel) UpdatePeerEndpoint(publicKey, newEndpoint string) error {
 	if !exists {
 		return fmt.Errorf("update peer endpoint: not found")
 	}
+	if w.wgReady {
+		if runtime.GOOS == "windows" {
+			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
+				if err := winDev.AddWGPeer(publicKey, newEndpoint, peer.AllowedIP); err != nil {
+					return fmt.Errorf("update peer endpoint: windows wg update: %w", err)
+				}
+			}
+		} else {
+			if err := updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint); err != nil {
+				return fmt.Errorf("update peer endpoint: wg update: %w", err)
+			}
+		}
+	}
+
 	peer.Endpoint = newEndpoint
 	peer.LastHandshake = time.Now().UTC()
 	w.stats.LastHandshake = peer.LastHandshake
 
-	if w.wgReady {
-		if runtime.GOOS == "windows" {
-			if winDev, ok := w.device.(*WindowsTUNDevice); ok {
-				_ = winDev.AddWGPeer(publicKey, newEndpoint, peer.AllowedIP)
-			}
-		} else {
-			_ = updateWGPeerEndpoint(w.deviceName, publicKey, newEndpoint)
-		}
-	}
 	return nil
 }
 

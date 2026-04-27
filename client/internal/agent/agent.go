@@ -23,10 +23,12 @@ import (
 )
 
 const (
-	heartbeatInterval      = 30 * time.Second
-	vncDiscoveryInterval   = 60 * time.Second
-	qualityMonitorInterval = 90 * time.Second
-	maxReconnectBackoff    = 2 * time.Minute
+	defaultHeartbeatInterval       = 30 * time.Second
+	defaultPeerSyncInterval        = 15 * time.Second
+	defaultVNCDiscoveryInterval    = 60 * time.Second
+	defaultQualityMonitorInterval  = 60 * time.Second
+	defaultEndpointRefreshInterval = 1 * time.Minute
+	maxReconnectBackoff            = 2 * time.Minute
 )
 
 type Agent struct {
@@ -38,14 +40,16 @@ type Agent struct {
 
 	state *StateMachine
 
-	mu             sync.RWMutex
-	virtualIP      string
-	peerID         string
-	memberID       string
-	memberToken    string
-	publicEndpoint string
-	vncPort        int
-	vncAvailable   bool
+	mu                  sync.RWMutex
+	virtualIP           string
+	peerID              string
+	memberID            string
+	memberToken         string
+	publicEndpoint      string
+	lastEndpointRefresh time.Time
+	wgListenPort        int
+	vncPort             int
+	vncAvailable        bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -92,24 +96,22 @@ func (a *Agent) Start() error {
 	)
 
 	if useMemberToken {
-		log.Info().Msg("using member_token auth (ZeroTier-style)")
+		log.Info().Msg("using member_token auth (zerotier-style)")
 		a.apiClient.SetMemberToken(a.config.MemberToken)
 
-		privateKey  = a.config.WGPrivateKey
-		virtualIP   = a.config.VirtualIP
+		privateKey = a.config.WGPrivateKey
+		virtualIP = a.config.VirtualIP
 		networkCIDR = a.config.NetworkCIDR
-		peerID      = a.config.MemberID
+		peerID = a.config.MemberID
 
 		a.mu.Lock()
-		a.memberID    = a.config.MemberID
+		a.memberID = a.config.MemberID
 		a.memberToken = a.config.MemberToken
 		a.mu.Unlock()
-
 	} else {
 		if strings.TrimSpace(a.config.APIKey) == "" {
 			if strings.TrimSpace(a.config.Email) == "" || strings.TrimSpace(a.config.Password) == "" {
-				return fmt.Errorf("agent start: api_key or (email/password) is required\n" +
-					"Tip: run  quicktunnel join <server> <network_id>  to join without an API key")
+				return fmt.Errorf("agent start: api_key or (email/password) is required\nTip: run quicktunnel join <server> <network_id>")
 			}
 			loginResp, err := a.apiClient.Login(a.config.Email, a.config.Password)
 			if err != nil {
@@ -120,7 +122,7 @@ func (a *Agent) Start() error {
 		}
 
 		a.state.Set(StateRegistering)
-		var pubKey string
+		pubKey := ""
 		var err error
 		privateKey, pubKey, err = pkgcrypto.GenerateKeyPair()
 		if err != nil {
@@ -144,18 +146,19 @@ func (a *Agent) Start() error {
 			return fmt.Errorf("agent start: register peer: %w", err)
 		}
 
-		virtualIP   = registerResp.VirtualIP
+		virtualIP = registerResp.VirtualIP
 		networkCIDR = registerResp.NetworkCIDR
-		peerID      = registerResp.PeerID
+		peerID = registerResp.PeerID
 	}
 
 	a.mu.Lock()
 	a.virtualIP = virtualIP
-	a.peerID    = peerID
+	a.peerID = peerID
 	a.mu.Unlock()
 
-	// ── WireGuard tunnel ──────────────────────────────────────────────────────
 	wgPort := maxInt(a.config.WGListenPort, 51820)
+	a.wgListenPort = wgPort
+
 	var err error
 	a.tunnel, err = tunnel.NewWGTunnel(privateKey, virtualIP, networkCIDR, wgPort)
 	if err != nil {
@@ -165,82 +168,78 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("agent start: start tunnel: %w", err)
 	}
 
-	// ── Hole puncher ─────────────────────────────────────────────────────────
 	a.holePuncher, err = nat.NewHolePuncher(0)
 	if err != nil {
 		log.Warn().Err(err).Msg("agent start: create hole puncher failed (non-fatal)")
 	}
 
-	// ── Endpoint discovery ────────────────────────────────────────────────────
 	a.state.Set(StateDiscovering)
-	publicIP, _, stunErr := nat.DiscoverPublicEndpoint(a.config.STUNServer)
-	if stunErr != nil {
-		publicIP = getOutboundIP()
-		if publicIP == "" {
-			log.Warn().Err(stunErr).Msg("agent start: STUN discovery failed — using loopback")
-			publicIP = "127.0.0.1"
-		}
+	endpoint, _, epErr := a.refreshEndpointIfNeeded(true)
+	if epErr != nil {
+		log.Warn().Err(epErr).Msg("agent start: endpoint discovery failed, using relay-first mode")
+		endpoint = ""
 	}
-	endpoint := net.JoinHostPort(publicIP, strconv.Itoa(wgPort))
 
-	a.mu.Lock()
-	a.publicEndpoint = endpoint
-	a.mu.Unlock()
+	if endpoint != "" {
+		log.Info().
+			Str("public_endpoint", endpoint).
+			Int("wg_port", wgPort).
+			Bool("wg_ready", a.tunnel.IsWGReady()).
+			Msg("endpoint discovered")
+	} else {
+		log.Warn().
+			Int("wg_port", wgPort).
+			Bool("wg_ready", a.tunnel.IsWGReady()).
+			Msg("public endpoint unavailable, peers will use relay fallback")
+	}
 
-	log.Info().
-		Str("public_endpoint", endpoint).
-		Int("wg_port", wgPort).
-		Bool("wg_ready", a.tunnel.IsWGReady()).
-		Msg("endpoint discovered")
-
-	// ── Announce endpoint ─────────────────────────────────────────────────────
-	localIPsWithPort := getLocalIPsWithPort(wgPort)
-
+	localEndpoints := getLocalIPsWithPort(wgPort)
 	if useMemberToken {
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
-			LocalEndpoints: localIPsWithPort,
+			LocalEndpoints: localEndpoints,
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
 	} else {
-		if err := a.apiClient.Announce(api_client.AnnounceRequest{
-			PeerID:         peerID,
-			NetworkID:      a.config.NetworkID,
-			PublicEndpoint: endpoint,
-			LocalEndpoints: localIPsWithPort,
-		}); err != nil {
-			log.Warn().Err(err).Msg("announce failed (non-fatal)")
+		if endpoint != "" {
+			if err := a.apiClient.Announce(api_client.AnnounceRequest{
+				PeerID:         peerID,
+				NetworkID:      a.config.NetworkID,
+				PublicEndpoint: endpoint,
+				LocalEndpoints: localEndpoints,
+			}); err != nil {
+				log.Warn().Err(err).Msg("agent start: announce failed (non-fatal)")
+			}
 		}
 	}
 
-	// ── VNC discovery ─────────────────────────────────────────────────────────
 	if a.config.VNCPort > 0 {
 		a.mu.Lock()
-		a.vncPort      = a.config.VNCPort
+		a.vncPort = a.config.VNCPort
 		a.vncAvailable = isLocalPortOpen(a.config.VNCPort)
 		a.mu.Unlock()
 	} else {
 		port, available := vnc.DiscoverVNCServer()
 		a.mu.Lock()
-		a.vncPort      = port
+		a.vncPort = port
 		a.vncAvailable = available
 		a.mu.Unlock()
 	}
 
-	// ── Peer manager ──────────────────────────────────────────────────────────
 	a.state.Set(StateConnecting)
 	a.peerMgr = peer.NewPeerManager(a.tunnel, a.apiClient, a.holePuncher, a.config.NetworkID, peerID)
 	if useMemberToken {
 		a.peerMgr.SetMemberID(peerID)
 	}
+	a.peerMgr.SetSyncInterval(a.peerSyncInterval())
 	a.peerMgr.Start()
 
 	if !a.tunnel.IsWGReady() {
-		log.Warn().Msg("WireGuard not ready — using raw TUN packet forwarding (ICMP only, TCP/UDP limited)")
+		log.Warn().Msg("wireguard not ready, using raw tun packet forwarding")
 		a.startPacketForwarding()
 	} else {
-		log.Info().Msg("WireGuard kernel/userspace mode active — kernel handles packet forwarding")
+		log.Info().Msg("wireguard mode active, kernel/userspace handles packet forwarding")
 	}
 
 	a.wg.Add(3)
@@ -255,7 +254,7 @@ func (a *Agent) Start() error {
 		Str("endpoint", endpoint).
 		Bool("zerotier_mode", useMemberToken).
 		Bool("wg_ready", a.tunnel.IsWGReady()).
-		Msg("QuickTunnel running")
+		Msg("quicktunnel running")
 	return nil
 }
 
@@ -284,7 +283,7 @@ func (a *Agent) Stop() error {
 }
 
 func (a *Agent) heartbeatLoop(useMemberToken bool) {
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(a.heartbeatInterval())
 	defer ticker.Stop()
 
 	failures := 0
@@ -329,30 +328,31 @@ func (a *Agent) sendMemberHeartbeat() error {
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
 
-	wgPort := maxInt(a.config.WGListenPort, 51820)
-
 	if memberID == "" {
 		return fmt.Errorf("send member heartbeat: member_id empty")
 	}
 
-	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
-		if fresh != endpoint {
-			a.mu.Lock()
-			a.publicEndpoint = fresh
-			a.mu.Unlock()
-			endpoint = fresh
-			_ = a.apiClient.MemberAnnounce(memberID, api_client.MemberAnnounceRequest{
-				PublicEndpoint: fresh,
-				LocalEndpoints: getLocalIPsWithPort(wgPort),
-			})
-		}
+	fresh, changed, err := a.refreshEndpointIfNeeded(false)
+	if err != nil {
+		log.Warn().Err(err).Msg("member heartbeat: endpoint refresh failed")
+	} else if fresh != "" {
+		endpoint = fresh
+	}
+
+	wgPort := a.currentWGPort()
+	localEndpoints := getLocalIPsWithPort(wgPort)
+
+	if changed {
+		_ = a.apiClient.MemberAnnounce(memberID, api_client.MemberAnnounceRequest{
+			PublicEndpoint: endpoint,
+			LocalEndpoints: localEndpoints,
+		})
 	}
 
 	stats := a.tunnel.GetStats()
 	return a.apiClient.MemberHeartbeat(memberID, api_client.MemberHeartbeatRequest{
 		PublicEndpoint: endpoint,
-		LocalEndpoints: getLocalIPsWithPort(wgPort),
+		LocalEndpoints: localEndpoints,
 		VNCAvailable:   vncAvail,
 		RXBytes:        int64(stats.RXBytes),
 		TXBytes:        int64(stats.TXBytes),
@@ -361,37 +361,38 @@ func (a *Agent) sendMemberHeartbeat() error {
 
 func (a *Agent) sendHeartbeat() error {
 	a.mu.RLock()
-	peerID   := a.peerID
+	peerID := a.peerID
 	endpoint := a.publicEndpoint
 	vncAvail := a.vncAvailable
 	a.mu.RUnlock()
-
-	wgPort := maxInt(a.config.WGListenPort, 51820)
 
 	if peerID == "" {
 		return fmt.Errorf("send heartbeat: peer id is empty")
 	}
 
-	if ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer); err == nil {
-		fresh := net.JoinHostPort(ip, strconv.Itoa(wgPort))
-		if fresh != endpoint {
-			a.mu.Lock()
-			a.publicEndpoint = fresh
-			a.mu.Unlock()
-			endpoint = fresh
-			_ = a.apiClient.Announce(api_client.AnnounceRequest{
-				PeerID:         peerID,
-				NetworkID:      a.config.NetworkID,
-				PublicEndpoint: fresh,
-				LocalEndpoints: getLocalIPsWithPort(wgPort),
-			})
-		}
+	fresh, changed, err := a.refreshEndpointIfNeeded(false)
+	if err != nil {
+		log.Warn().Err(err).Msg("heartbeat: endpoint refresh failed")
+	} else if fresh != "" {
+		endpoint = fresh
+	}
+
+	wgPort := a.currentWGPort()
+	localEndpoints := getLocalIPsWithPort(wgPort)
+
+	if changed {
+		_ = a.apiClient.Announce(api_client.AnnounceRequest{
+			PeerID:         peerID,
+			NetworkID:      a.config.NetworkID,
+			PublicEndpoint: endpoint,
+			LocalEndpoints: localEndpoints,
+		})
 	}
 
 	stats := a.tunnel.GetStats()
 	return a.apiClient.Heartbeat(a.config.NetworkID, peerID, api_client.PeerStatus{
 		PublicEndpoint: endpoint,
-		LocalEndpoints: getLocalIPsWithPort(wgPort),
+		LocalEndpoints: localEndpoints,
 		VNCAvailable:   vncAvail,
 		RXBytes:        int64(stats.RXBytes),
 		TXBytes:        int64(stats.TXBytes),
@@ -399,7 +400,7 @@ func (a *Agent) sendHeartbeat() error {
 }
 
 func (a *Agent) vncDiscoveryLoop() {
-	ticker := time.NewTicker(vncDiscoveryInterval)
+	ticker := time.NewTicker(a.vncDiscoveryInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -414,7 +415,7 @@ func (a *Agent) vncDiscoveryLoop() {
 			}
 			port, available := vnc.DiscoverVNCServer()
 			a.mu.Lock()
-			a.vncPort      = port
+			a.vncPort = port
 			a.vncAvailable = available
 			a.mu.Unlock()
 		}
@@ -422,7 +423,7 @@ func (a *Agent) vncDiscoveryLoop() {
 }
 
 func (a *Agent) qualityMonitorLoop() {
-	ticker := time.NewTicker(qualityMonitorInterval)
+	ticker := time.NewTicker(a.qualityMonitorInterval())
 	defer ticker.Stop()
 	probeCount := 0
 	for {
@@ -537,6 +538,84 @@ func (a *Agent) Connections() []peer.PeerConnection {
 	return a.peerMgr.ListConnections()
 }
 
+func (a *Agent) refreshEndpointIfNeeded(force bool) (string, bool, error) {
+	a.mu.RLock()
+	current := a.publicEndpoint
+	last := a.lastEndpointRefresh
+	a.mu.RUnlock()
+
+	now := time.Now().UTC()
+	if !force && current != "" && now.Sub(last) < a.endpointRefreshInterval() {
+		return current, false, nil
+	}
+
+	ip, err := a.discoverPublicIP()
+	if err != nil {
+		if current != "" {
+			return current, false, nil
+		}
+		return "", false, err
+	}
+
+	fresh := net.JoinHostPort(ip, strconv.Itoa(a.currentWGPort()))
+	a.mu.Lock()
+	changed := fresh != a.publicEndpoint
+	a.publicEndpoint = fresh
+	a.lastEndpointRefresh = now
+	a.mu.Unlock()
+	return fresh, changed, nil
+}
+
+func (a *Agent) discoverPublicIP() (string, error) {
+	ip, _, err := nat.DiscoverPublicEndpoint(a.config.STUNServer)
+	if err == nil {
+		parsed := net.ParseIP(strings.TrimSpace(ip))
+		if isRoutableIPv4(parsed) {
+			return parsed.String(), nil
+		}
+	}
+
+	fallback := getOutboundIP()
+	fallbackIP := net.ParseIP(strings.TrimSpace(fallback))
+	if isRoutableIPv4(fallbackIP) {
+		return fallbackIP.String(), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("no routable public endpoint available")
+}
+
+func (a *Agent) currentWGPort() int {
+	a.mu.RLock()
+	port := a.wgListenPort
+	a.mu.RUnlock()
+	if port > 0 {
+		return port
+	}
+	return maxInt(a.config.WGListenPort, 51820)
+}
+
+func (a *Agent) heartbeatInterval() time.Duration {
+	return boundedSeconds(a.config.HeartbeatIntervalSec, defaultHeartbeatInterval, 10, 600)
+}
+
+func (a *Agent) peerSyncInterval() time.Duration {
+	return boundedSeconds(a.config.PeerSyncIntervalSec, defaultPeerSyncInterval, 10, 600)
+}
+
+func (a *Agent) vncDiscoveryInterval() time.Duration {
+	return defaultVNCDiscoveryInterval
+}
+
+func (a *Agent) qualityMonitorInterval() time.Duration {
+	return boundedSeconds(a.config.QualityMonitorIntervalSec, defaultQualityMonitorInterval, 30, 1800)
+}
+
+func (a *Agent) endpointRefreshInterval() time.Duration {
+	return boundedSeconds(a.config.EndpointRefreshIntervalSec, defaultEndpointRefreshInterval, 60, 3600)
+}
+
 func runtimeOS() string { return strings.ToLower(runtime.GOOS) }
 
 func maxInt(value, fallback int) int {
@@ -551,6 +630,19 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func boundedSeconds(value int, fallback time.Duration, minSec, maxSec int) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	if value < minSec {
+		value = minSec
+	}
+	if value > maxSec {
+		value = maxSec
+	}
+	return time.Duration(value) * time.Second
 }
 
 func isLocalPortOpen(port int) bool {
@@ -576,6 +668,28 @@ func getOutboundIP() string {
 		return ""
 	}
 	return addr.IP.String()
+}
+
+func isRoutableIPv4(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ip.IsPrivate() {
+		return false
+	}
+	// Link-local 169.254.0.0/16
+	if v4[0] == 169 && v4[1] == 254 {
+		return false
+	}
+	// Carrier-grade NAT 100.64.0.0/10
+	if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	return true
 }
 
 func getLocalIPsWithPort(port int) []string {
