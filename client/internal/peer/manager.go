@@ -176,10 +176,23 @@ func (m *PeerManager) syncPeersOnce() error {
 
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
 func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
+	// Priority 1: Public endpoint with WireGuard listen port.
+	// This is the safest default across NATed networks.
+	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
+		host, _, err := net.SplitHostPort(publicEndpoint)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+				return net.JoinHostPort(host, "51820")
+			}
+		}
+		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
+			return net.JoinHostPort(publicEndpoint, "51820")
+		}
+	}
+
+	// Priority 2: Same-LAN local endpoint fallback (only when no public endpoint).
 	addrs, _ := net.InterfaceAddrs()
 	_, tunNet, _ := net.ParseCIDR(tunCIDR)
-
-	// Priority 1: Same LAN subnet
 	for _, ep := range localEndpoints {
 		peerHost, peerPort, err := net.SplitHostPort(ep)
 		if err != nil {
@@ -193,34 +206,15 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 		if strings.HasPrefix(peerHost, "169.254.") || peerHost == "127.0.0.1" {
 			continue
 		}
-		// Ignore local endpoints that are actually tunnel addresses.
 		if tunNet != nil && tunNet.Contains(peerIP) {
 			continue
 		}
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
 				if ipnet.Contains(peerIP) {
-					if peerPort == "" {
-						peerPort = "51820"
-					}
 					return net.JoinHostPort(peerHost, peerPort)
 				}
 			}
-		}
-	}
-
-	// Priority 2: Public endpoint with WireGuard listen port.
-	// NOTE: Do not use arbitrary private endpoints from other LANs.
-	// They are usually unreachable and cause persistent no-handshake states.
-	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
-		host, _, err := net.SplitHostPort(publicEndpoint)
-		if err == nil {
-			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-				return net.JoinHostPort(host, "51820")
-			}
-		}
-		if ip := net.ParseIP(publicEndpoint); ip != nil && ip.To4() != nil {
-			return net.JoinHostPort(publicEndpoint, "51820")
 		}
 	}
 
