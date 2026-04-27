@@ -330,7 +330,7 @@ func (d *WindowsTUNDevice) cleanFirewall() {
 func (d *WindowsTUNDevice) startUAPI() {
 	uapiLn, err := ipc.UAPIListen(d.name)
 	if err != nil {
-		logW("UAPI", "Listen failed: %v", err)
+		logW("UAPI", "Listen skipped (run as SYSTEM for wg CLI support): %v", err.Error())
 		return
 	}
 	d.uapiLn = uapiLn
@@ -426,3 +426,4 @@ func logW(tag, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("[WIN-%s] %s\n", tag, msg)
 }
+
