@@ -132,13 +132,17 @@ func (m *PeerManager) syncPeersOnce() error {
 		m.mu.RUnlock()
 
 		if !alreadyConnected {
-			_ = m.connectToPeer(peerInfo)
+			if err := m.connectToPeer(peerInfo); err != nil {
+				fmt.Printf("[PEER] connect failed peer=%s (%s): %v\n", peerInfo.Name, peerInfo.ID, err)
+			}
 			continue
 		}
 
 		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints, m.tunnel.CIDR())
 		if newEndpoint != "" && newEndpoint != existing.Endpoint {
-			_ = m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint)
+			if err := m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint); err != nil {
+				fmt.Printf("[PEER] endpoint update failed peer=%s (%s): %v\n", peerInfo.Name, peerInfo.ID, err)
+			}
 			m.mu.Lock()
 			if conn, ok := m.peers[peerInfo.ID]; ok {
 				conn.Endpoint = newEndpoint
@@ -205,35 +209,9 @@ func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) 
 		}
 	}
 
-	// Priority 2: Any private RFC1918 local endpoint
-	for _, ep := range localEndpoints {
-		host, port, err := net.SplitHostPort(ep)
-		if err != nil {
-			host = ep
-			port = "51820"
-		}
-		peerIP := net.ParseIP(host)
-		if peerIP == nil || peerIP.To4() == nil {
-			continue
-		}
-		if strings.HasPrefix(host, "169.254.") {
-			continue
-		}
-		if tunNet != nil && tunNet.Contains(peerIP) {
-			continue
-		}
-		isPrivate := strings.HasPrefix(host, "10.") ||
-			strings.HasPrefix(host, "192.168.") ||
-			isPrivate172(host)
-		if isPrivate {
-			if port == "" {
-				port = "51820"
-			}
-			return net.JoinHostPort(host, port)
-		}
-	}
-
-	// Priority 3: Public endpoint with port 51820
+	// Priority 2: Public endpoint with WireGuard listen port.
+	// NOTE: Do not use arbitrary private endpoints from other LANs.
+	// They are usually unreachable and cause persistent no-handshake states.
 	if publicEndpoint != "" && !strings.HasPrefix(publicEndpoint, "[") {
 		host, _, err := net.SplitHostPort(publicEndpoint)
 		if err == nil {
@@ -400,16 +378,4 @@ func splitHostPort(endpoint string) (string, int, error) {
 		return "", 0, fmt.Errorf("split host port: port out of range")
 	}
 	return host, port, nil
-}
-
-func isPrivate172(host string) bool {
-	parts := strings.Split(host, ".")
-	if len(parts) < 2 || parts[0] != "172" {
-		return false
-	}
-	second, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return false
-	}
-	return second >= 16 && second <= 31
 }
