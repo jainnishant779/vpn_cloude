@@ -166,6 +166,7 @@ func (m *PeerManager) syncPeersOnce() error {
 				newConnectedVia = "relay"
 			}
 		}
+		newEndpoint = m.sanitizeEndpoint(newEndpoint, 51820)
 
 		if newEndpoint != "" && newEndpoint != existing.Endpoint {
 			if err := m.tunnel.UpdatePeerEndpoint(existing.PublicKey, newEndpoint); err != nil {
@@ -350,6 +351,10 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 	if endpoint == "" {
 		return fmt.Errorf("connect to peer: no endpoint available for %s", peer.Name)
 	}
+	endpoint = m.sanitizeEndpoint(endpoint, 51820)
+	if endpoint == "" {
+		return fmt.Errorf("connect to peer: invalid endpoint for %s", peer.Name)
+	}
 
 	allowedIP := strings.TrimSpace(peer.VirtualIP)
 	if allowedIP == "" {
@@ -388,7 +393,7 @@ func (m *PeerManager) addPeerWithFallback(peer api_client.PeerInfo, primaryEndpo
 	candidates := make([]candidate, 0, 3)
 	seen := map[string]struct{}{}
 	addCandidate := func(endpoint, via string) {
-		endpoint = strings.TrimSpace(endpoint)
+		endpoint = m.sanitizeEndpoint(endpoint, 51820)
 		if endpoint == "" {
 			return
 		}
@@ -457,10 +462,11 @@ func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
 	if port <= 0 || port > 65535 {
 		port = 3478
 	}
-	if isInternalHostName(host) {
+	endpoint := m.sanitizeEndpoint(net.JoinHostPort(host, strconv.Itoa(port)), 3478)
+	if endpoint == "" {
 		return "", fmt.Errorf("invalid relay endpoint")
 	}
-	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+	return endpoint, nil
 }
 
 func (m *PeerManager) disconnectPeer(peerID string) error {
@@ -564,5 +570,44 @@ func splitHostPort(endpoint string) (string, int, error) {
 		return "", 0, fmt.Errorf("split host port: port out of range")
 	}
 	return host, port, nil
+}
+
+func (m *PeerManager) sanitizeEndpoint(endpoint string, defaultPort int) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+
+	host := endpoint
+	port := defaultPort
+
+	if h, p, err := net.SplitHostPort(endpoint); err == nil {
+		host = strings.TrimSpace(h)
+		if parsed, err := strconv.Atoi(strings.TrimSpace(p)); err == nil && parsed > 0 && parsed <= 65535 {
+			port = parsed
+		}
+	} else if strings.Count(endpoint, ":") == 1 && !strings.HasPrefix(endpoint, "[") {
+		parts := strings.SplitN(endpoint, ":", 2)
+		host = strings.TrimSpace(parts[0])
+		if parsed, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && parsed > 0 && parsed <= 65535 {
+			port = parsed
+		}
+	}
+
+	host = strings.Trim(host, "[]")
+	if isInternalHostName(host) && m.apiClient != nil {
+		fallback := strings.TrimSpace(m.apiClient.PublicHost())
+		if !isInternalHostName(fallback) {
+			host = fallback
+		}
+	}
+	if isInternalHostName(host) {
+		return ""
+	}
+
+	if port <= 0 || port > 65535 {
+		port = defaultPort
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 

@@ -189,6 +189,8 @@ func (h *ClientDownloadHandler) findExistingBinary(spec clientBinarySpec) string
 		dirs = discoverBinaryDirs(h.projectRoot)
 	}
 
+	bestPath := ""
+	var bestModTime time.Time
 	seen := map[string]struct{}{}
 	for _, dir := range dirs {
 		cleaned := filepath.Clean(strings.TrimSpace(dir))
@@ -201,12 +203,17 @@ func (h *ClientDownloadHandler) findExistingBinary(spec clientBinarySpec) string
 		seen[cleaned] = struct{}{}
 
 		targetPath := filepath.Join(cleaned, spec.Filename)
-		if fileExists(targetPath) {
-			return targetPath
+		info, err := os.Stat(targetPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if bestPath == "" || info.ModTime().After(bestModTime) {
+			bestPath = targetPath
+			bestModTime = info.ModTime()
 		}
 	}
 
-	return ""
+	return bestPath
 }
 
 func (h *ClientDownloadHandler) defaultBuildBinary(spec clientBinarySpec, targetPath string) error {

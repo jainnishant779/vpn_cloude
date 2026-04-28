@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
@@ -108,4 +109,39 @@ func TestClientDownloadHandlerRejectsUnsupportedPlatform(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
 	require.False(t, payload.Success)
 	require.Equal(t, "unsupported client platform", payload.Error)
+}
+
+func TestClientDownloadHandlerPrefersNewestArtifact(t *testing.T) {
+	tempDir := t.TempDir()
+	oldDir := filepath.Join(tempDir, "old", "bin")
+	newDir := filepath.Join(tempDir, "new", "bin")
+	require.NoError(t, os.MkdirAll(oldDir, 0o755))
+	require.NoError(t, os.MkdirAll(newDir, 0o755))
+
+	oldPath := filepath.Join(oldDir, "quicktunnel-linux-amd64")
+	newPath := filepath.Join(newDir, "quicktunnel-linux-amd64")
+	require.NoError(t, os.WriteFile(oldPath, []byte("old-data"), 0o755))
+	require.NoError(t, os.WriteFile(newPath, []byte("new-data"), 0o755))
+
+	now := time.Now()
+	require.NoError(t, os.Chtimes(oldPath, now.Add(-1*time.Hour), now.Add(-1*time.Hour)))
+	require.NoError(t, os.Chtimes(newPath, now, now))
+
+	handler := &ClientDownloadHandler{
+		binaryDirs: []string{oldDir, newDir},
+	}
+	handler.buildBinary = func(spec clientBinarySpec, targetPath string) error {
+		t.Fatalf("build should not run when artifacts already exist")
+		return nil
+	}
+
+	router := chi.NewRouter()
+	router.Get("/api/v1/downloads/client/{os}/{arch}", handler.Get)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/downloads/client/linux/amd64", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "new-data", rec.Body.String())
 }
