@@ -308,7 +308,11 @@ func hostFromEndpoint(raw string) string {
 }
 
 func isInternalRelayHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
+	h := strings.TrimSpace(host)
+	if hostOnly, _, err := net.SplitHostPort(h); err == nil {
+		h = hostOnly
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
 	if h == "" {
 		return true
 	}
@@ -316,7 +320,15 @@ func isInternalRelayHost(host string) bool {
 	case "relay", "server", "localhost":
 		return true
 	}
-	if h == "0.0.0.0" || h == "::" || h == "::1" || h == "127.0.0.1" {
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() {
+			return true
+		}
+		return false
+	}
+	// Single-label hostnames like "relay" / "server" are typically internal
+	// Docker/K8s service names and not routable from clients.
+	if !strings.Contains(h, ".") {
 		return true
 	}
 	return false
@@ -328,6 +340,11 @@ func (c *Client) relayHostFromBaseURL() string {
 		return ""
 	}
 	return host
+}
+
+// PublicHost returns the externally reachable host derived from baseURL.
+func (c *Client) PublicHost() string {
+	return c.relayHostFromBaseURL()
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, authMode requestAuthMode, responseTarget any) error {

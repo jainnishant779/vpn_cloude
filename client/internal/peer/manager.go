@@ -238,6 +238,9 @@ func normalizePublicEndpoint(publicEndpoint string) string {
 			}
 			return net.JoinHostPort(ip.String(), port)
 		}
+		if isInternalHostName(host) {
+			return ""
+		}
 		// Hostname endpoint. Keep announced port as-is.
 		return net.JoinHostPort(host, port)
 	}
@@ -285,6 +288,22 @@ func preferLANEndpoint(localEndpoints []string, tunCIDR string) string {
 func lanFallbackEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("QT_ENABLE_LAN_ENDPOINT_FALLBACK")))
 	return v == "1" || v == "true" || v == "yes"
+}
+
+func isInternalHostName(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return true
+	}
+	switch h {
+	case "relay", "server", "localhost":
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	// Single-label hostnames are usually internal service names.
+	return !strings.Contains(h, ".")
 }
 
 func isRoutableIPv4(ip net.IP) bool {
@@ -418,11 +437,30 @@ func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	host := strings.TrimSpace(relayInfo.RelayHost)
-	if host == "" || relayInfo.RelayPort <= 0 {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
+			host = h
+		}
+	}
+	if isInternalHostName(host) {
+		if h, _, splitErr := net.SplitHostPort(strings.TrimSpace(relayInfo.RelayEndpoint)); splitErr == nil && !isInternalHostName(h) {
+			host = h
+		}
+	}
+	if isInternalHostName(host) {
+		host = m.apiClient.PublicHost()
+	}
+
+	port := relayInfo.RelayPort
+	if port <= 0 || port > 65535 {
+		port = 3478
+	}
+	if isInternalHostName(host) {
 		return "", fmt.Errorf("invalid relay endpoint")
 	}
-	return net.JoinHostPort(host, strconv.Itoa(relayInfo.RelayPort)), nil
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 func (m *PeerManager) disconnectPeer(peerID string) error {
@@ -458,20 +496,10 @@ func (m *PeerManager) ForceRelay(peerID string) error {
 	if !exists {
 		return fmt.Errorf("force relay: peer not connected")
 	}
-	var relayInfo *api_client.RelayInfo
-	var err error
-	if m.memberID != "" {
-		relayInfo, err = m.apiClient.MemberGetNearestRelay(m.memberID, m.networkID, peerID)
-	} else {
-		relayInfo, err = m.apiClient.GetNearestRelay(m.networkID, peerID)
-		if err != nil && strings.Contains(strings.ToLower(err.Error()), "missing api key") && strings.TrimSpace(m.localPeerID) != "" {
-			relayInfo, err = m.apiClient.MemberGetNearestRelay(m.localPeerID, m.networkID, peerID)
-		}
-	}
+	endpoint, err := m.resolveRelayEndpoint(peerID)
 	if err != nil {
 		return fmt.Errorf("force relay: assign relay: %w", err)
 	}
-	endpoint := net.JoinHostPort(relayInfo.RelayHost, strconv.Itoa(relayInfo.RelayPort))
 	if err := m.tunnel.UpdatePeerEndpoint(conn.PublicKey, endpoint); err != nil {
 		return fmt.Errorf("force relay: update tunnel endpoint: %w", err)
 	}
