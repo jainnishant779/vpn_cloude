@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -115,12 +116,13 @@ type AnnounceRequest struct {
 
 // RelayInfo describes relay fallback assignment details.
 type RelayInfo struct {
-	PeerID    string `json:"peer_id"`
-	RelayID   string `json:"relay_id"`
-	RelayHost string `json:"relay_host"`
-	RelayPort int    `json:"relay_port"`
-	Token     string `json:"token"`
-	Region    string `json:"region"`
+	PeerID        string `json:"peer_id"`
+	RelayID       string `json:"relay_id"`
+	RelayHost     string `json:"relay_host"`
+	RelayPort     int    `json:"relay_port"`
+	Token         string `json:"token"`
+	Region        string `json:"region"`
+	RelayEndpoint string `json:"relay_endpoint,omitempty"`
 }
 
 type responseEnvelope struct {
@@ -235,6 +237,7 @@ func (c *Client) GetNearestRelay(networkID, peerID string) (*RelayInfo, error) {
 	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authAPIKey, &out); err != nil {
 		return nil, fmt.Errorf("get nearest relay: %w", err)
 	}
+	c.normalizeRelayInfo(&out)
 	return &out, nil
 }
 
@@ -251,7 +254,80 @@ func (c *Client) MemberGetNearestRelay(memberID, networkID, targetPeerID string)
 	if err := c.doJSON(context.Background(), http.MethodGet, path, nil, authMemberToken, &out); err != nil {
 		return nil, fmt.Errorf("member get nearest relay: %w", err)
 	}
+	c.normalizeRelayInfo(&out)
 	return &out, nil
+}
+
+func (c *Client) normalizeRelayInfo(info *RelayInfo) {
+	if info == nil {
+		return
+	}
+	if info.RelayPort <= 0 || info.RelayPort > 65535 {
+		info.RelayPort = 3478
+	}
+
+	host := strings.TrimSpace(info.RelayHost)
+	if !isInternalRelayHost(host) {
+		return
+	}
+
+	// Prefer explicit relay_endpoint host if present.
+	if endpointHost := hostFromEndpoint(info.RelayEndpoint); endpointHost != "" && !isInternalRelayHost(endpointHost) {
+		info.RelayHost = endpointHost
+		return
+	}
+
+	// Fallback to coordination server host.
+	if fallback := c.relayHostFromBaseURL(); fallback != "" {
+		info.RelayHost = fallback
+	}
+}
+
+func relayHostFromURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil {
+		return ""
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return ""
+	}
+	return strings.TrimSpace(host)
+}
+
+func hostFromEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err == nil {
+		return strings.TrimSpace(host)
+	}
+	return raw
+}
+
+func isInternalRelayHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" {
+		return true
+	}
+	switch h {
+	case "relay", "server", "localhost":
+		return true
+	}
+	if h == "0.0.0.0" || h == "::" || h == "::1" || h == "127.0.0.1" {
+		return true
+	}
+	return false
+}
+
+func (c *Client) relayHostFromBaseURL() string {
+	host := relayHostFromURL(c.baseURL)
+	if host == "" || isInternalRelayHost(host) {
+		return ""
+	}
+	return host
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, authMode requestAuthMode, responseTarget any) error {
