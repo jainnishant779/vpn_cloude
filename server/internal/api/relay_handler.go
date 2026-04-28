@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
+	"net/url"
 	"net/http"
 	"os"
 	"strconv"
@@ -38,10 +39,21 @@ func RelayAssignHandler(cfg *config.Config) http.HandlerFunc {
 		}
 		relayEndpoint := os.Getenv("RELAY_ENDPOINT")
 		if relayEndpoint == "" || relayEndpoint == "relay:3478" {
-			hostStr := r.Header.Get("X-Forwarded-Host")
+			hostStr := ""
+
+			// Prefer explicit public server URL if provided.
+			if raw := strings.TrimSpace(os.Getenv("PUBLIC_SERVER_URL")); raw != "" {
+				if parsed, err := url.Parse(raw); err == nil {
+					hostStr = parsed.Host
+				}
+			}
+			if hostStr == "" {
+				hostStr = r.Header.Get("X-Forwarded-Host")
+			}
 			if hostStr == "" {
 				hostStr = r.Host
 			}
+
 			if idx := strings.IndexByte(hostStr, ','); idx >= 0 {
 				hostStr = hostStr[:idx]
 			}

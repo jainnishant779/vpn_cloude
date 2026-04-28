@@ -19,7 +19,8 @@ sleep 1
 
 # Start server
 cd ~/vpn
-export PUBLIC_SERVER_URL="http://3.93.45.218:3000"
+export PUBLIC_SERVER_URL="http://3.93.162.156:3000"
+export RELAY_ENDPOINT="3.93.162.156:3478"
 sudo -E nohup ./server/quicktunnel-server > server.log 2>&1 < /dev/null &
 echo "Server restarted (PID: $!)"
 

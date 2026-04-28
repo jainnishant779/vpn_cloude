@@ -89,7 +89,7 @@ USAGE:
   quicktunnel-win.exe version                       Show version
 
 EXAMPLES:
-  quicktunnel-win.exe join 3.91.223.8 5agrlxob7exh
+  quicktunnel-win.exe join <server-ip> <network-id>
   quicktunnel-win.exe status
 
 `, appName, appVersion)
