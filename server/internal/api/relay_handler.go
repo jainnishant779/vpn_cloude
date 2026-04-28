@@ -37,8 +37,25 @@ func RelayAssignHandler(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 		relayEndpoint := os.Getenv("RELAY_ENDPOINT")
-		if relayEndpoint == "" {
-			relayEndpoint = "relay:3478"
+		if relayEndpoint == "" || relayEndpoint == "relay:3478" {
+			hostStr := r.Header.Get("X-Forwarded-Host")
+			if hostStr == "" {
+				hostStr = r.Host
+			}
+			if idx := strings.IndexByte(hostStr, ','); idx >= 0 {
+				hostStr = hostStr[:idx]
+			}
+			hostStr = strings.TrimSpace(hostStr)
+
+			if h, _, err := net.SplitHostPort(hostStr); err == nil {
+				hostStr = h
+			}
+
+			if hostStr != "" && hostStr != "relay" && hostStr != "server" {
+				relayEndpoint = hostStr + ":3478"
+			} else {
+				relayEndpoint = "relay:3478"
+			}
 		}
 		relayHost := relayEndpoint
 		relayPort := 3478
