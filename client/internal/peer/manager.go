@@ -340,7 +340,8 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 		allowedIP += "/32"
 	}
 
-	if err := m.tunnel.AddPeer(peer.PublicKey, endpoint, allowedIP); err != nil {
+	finalEndpoint, finalVia, err := m.addPeerWithFallback(peer, endpoint, connectedVia, allowedIP)
+	if err != nil {
 		return fmt.Errorf("connect to peer: add tunnel peer: %w", err)
 	}
 
@@ -350,13 +351,54 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 		PeerName:     peer.Name,
 		PublicKey:    peer.PublicKey,
 		VirtualIP:    peer.VirtualIP,
-		Endpoint:     endpoint,
-		ConnectedVia: connectedVia,
+		Endpoint:     finalEndpoint,
+		ConnectedVia: finalVia,
 		LastSeen:     time.Now().UTC(),
 	}
 	m.mu.Unlock()
 
 	return nil
+}
+
+func (m *PeerManager) addPeerWithFallback(peer api_client.PeerInfo, primaryEndpoint, primaryVia, allowedIP string) (string, string, error) {
+	type candidate struct {
+		endpoint string
+		via      string
+	}
+
+	candidates := make([]candidate, 0, 3)
+	seen := map[string]struct{}{}
+	addCandidate := func(endpoint, via string) {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			return
+		}
+		if _, ok := seen[endpoint]; ok {
+			return
+		}
+		seen[endpoint] = struct{}{}
+		candidates = append(candidates, candidate{endpoint: endpoint, via: via})
+	}
+
+	addCandidate(primaryEndpoint, primaryVia)
+
+	// If relay fails, try direct public endpoint and then LAN endpoint.
+	addCandidate(normalizePublicEndpoint(peer.PublicEndpoint), "p2p")
+	addCandidate(preferLANEndpoint(peer.LocalEndpoints, m.tunnel.CIDR()), "lan")
+
+	var lastErr error
+	for _, c := range candidates {
+		if err := m.tunnel.AddPeer(peer.PublicKey, c.endpoint, allowedIP); err != nil {
+			lastErr = err
+			continue
+		}
+		return c.endpoint, c.via, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no endpoint candidates available")
+	}
+	return "", "", lastErr
 }
 
 func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
