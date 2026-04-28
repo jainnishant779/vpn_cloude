@@ -35,6 +35,7 @@ type PeerManager struct {
 	networkID   string
 	localPeerID string
 	memberID    string
+	localPublicEndpoint string
 
 	handshakeSecret []byte
 
@@ -70,6 +71,12 @@ func NewPeerManager(
 
 func (m *PeerManager) SetMemberID(memberID string) {
 	m.memberID = memberID
+}
+
+func (m *PeerManager) SetLocalPublicEndpoint(endpoint string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.localPublicEndpoint = strings.TrimSpace(endpoint)
 }
 
 func (m *PeerManager) SetSyncInterval(d time.Duration) {
@@ -157,9 +164,8 @@ func (m *PeerManager) syncPeersOnce() error {
 			continue
 		}
 
-		newEndpoint := preferIPv4(peerInfo.PublicEndpoint, peerInfo.LocalEndpoints, m.tunnel.CIDR())
-		newConnectedVia := "p2p"
-		if newEndpoint == "" {
+		newEndpoint, newConnectedVia := m.selectDirectOrLANEndpoint(peerInfo)
+		if newEndpoint == "" && !m.tunnel.IsWGReady() {
 			relayEndpoint, err := m.resolveRelayEndpoint(peerInfo.ID)
 			if err == nil && relayEndpoint != "" {
 				newEndpoint = relayEndpoint
@@ -334,10 +340,9 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 		return fmt.Errorf("connect to peer: tunnel is nil")
 	}
 
-	endpoint := preferIPv4(peer.PublicEndpoint, peer.LocalEndpoints, m.tunnel.CIDR())
-	connectedVia := "p2p"
+	endpoint, connectedVia := m.selectDirectOrLANEndpoint(peer)
 
-	if endpoint == "" {
+	if endpoint == "" && !m.tunnel.IsWGReady() {
 		relayEndpoint, err := m.resolveRelayEndpoint(peer.ID)
 		if err != nil {
 			return fmt.Errorf("connect to peer: resolve relay endpoint: %w", err)
@@ -520,6 +525,10 @@ func (m *PeerManager) ForceRelay(peerID string) error {
 }
 
 func (m *PeerManager) AttemptDirect(peerID string) error {
+	if m.tunnel != nil && m.tunnel.IsWGReady() {
+		return nil
+	}
+
 	peers, err := m.fetchPeers()
 	if err != nil {
 		return fmt.Errorf("attempt direct: fetch peers: %w", err)
@@ -570,6 +579,51 @@ func splitHostPort(endpoint string) (string, int, error) {
 		return "", 0, fmt.Errorf("split host port: port out of range")
 	}
 	return host, port, nil
+}
+
+func (m *PeerManager) selectDirectOrLANEndpoint(peer api_client.PeerInfo) (string, string) {
+	direct := m.sanitizeEndpoint(normalizePublicEndpoint(peer.PublicEndpoint), 51820)
+	lan := m.sanitizeEndpoint(preferLANEndpoint(peer.LocalEndpoints, m.tunnel.CIDR()), 51820)
+
+	// If both peers appear behind the same public NAT, LAN endpoint is usually
+	// the only stable path (many routers don't support NAT hairpin reliably).
+	if lan != "" && m.samePublicNAT(peer.PublicEndpoint) {
+		return lan, "lan"
+	}
+	if direct != "" {
+		return direct, "p2p"
+	}
+	if lan != "" && lanFallbackEnabled() {
+		return lan, "lan"
+	}
+	return "", ""
+}
+
+func (m *PeerManager) samePublicNAT(peerPublicEndpoint string) bool {
+	m.mu.RLock()
+	local := m.localPublicEndpoint
+	m.mu.RUnlock()
+
+	localHost := endpointHost(local)
+	peerHost := endpointHost(peerPublicEndpoint)
+	if localHost == "" || peerHost == "" {
+		return false
+	}
+	return strings.EqualFold(localHost, peerHost)
+}
+
+func endpointHost(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(endpoint); err == nil {
+		return strings.Trim(strings.TrimSpace(host), "[]")
+	}
+	if ip := net.ParseIP(endpoint); ip != nil {
+		return ip.String()
+	}
+	return strings.Trim(endpoint, "[]")
 }
 
 func (m *PeerManager) sanitizeEndpoint(endpoint string, defaultPort int) string {
