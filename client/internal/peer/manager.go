@@ -369,6 +369,9 @@ func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
 		relayInfo, err = m.apiClient.MemberGetNearestRelay(m.memberID, m.networkID, peerID)
 	} else {
 		relayInfo, err = m.apiClient.GetNearestRelay(m.networkID, peerID)
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "missing api key") && strings.TrimSpace(m.localPeerID) != "" {
+			relayInfo, err = m.apiClient.MemberGetNearestRelay(m.localPeerID, m.networkID, peerID)
+		}
 	}
 	if err != nil {
 		return "", err
@@ -419,6 +422,9 @@ func (m *PeerManager) ForceRelay(peerID string) error {
 		relayInfo, err = m.apiClient.MemberGetNearestRelay(m.memberID, m.networkID, peerID)
 	} else {
 		relayInfo, err = m.apiClient.GetNearestRelay(m.networkID, peerID)
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "missing api key") && strings.TrimSpace(m.localPeerID) != "" {
+			relayInfo, err = m.apiClient.MemberGetNearestRelay(m.localPeerID, m.networkID, peerID)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("force relay: assign relay: %w", err)
