@@ -342,12 +342,12 @@ func (m *PeerManager) connectToPeer(peer api_client.PeerInfo) error {
 
 	endpoint, connectedVia := m.selectDirectOrLANEndpoint(peer)
 
-	if endpoint == "" && !m.tunnel.IsWGReady() {
+	// If no direct/LAN endpoint found, try relay as fallback.
+	// Previously this was gated on !m.tunnel.IsWGReady(), but relay is
+	// needed whenever direct path fails — e.g. same-NAT without LAN.
+	if endpoint == "" {
 		relayEndpoint, err := m.resolveRelayEndpoint(peer.ID)
-		if err != nil {
-			return fmt.Errorf("connect to peer: resolve relay endpoint: %w", err)
-		}
-		if relayEndpoint != "" {
+		if err == nil && relayEndpoint != "" {
 			endpoint = relayEndpoint
 			connectedVia = "relay"
 		}
@@ -585,10 +585,20 @@ func (m *PeerManager) selectDirectOrLANEndpoint(peer api_client.PeerInfo) (strin
 	direct := m.sanitizeEndpoint(normalizePublicEndpoint(peer.PublicEndpoint), 51820)
 	lan := m.sanitizeEndpoint(preferLANEndpoint(peer.LocalEndpoints, m.tunnel.CIDR()), 51820)
 
-	// If both peers appear behind the same public NAT, LAN endpoint is usually
-	// the only stable path (many routers don't support NAT hairpin reliably).
-	if lan != "" && m.samePublicNAT(peer.PublicEndpoint) {
-		return lan, "lan"
+	sameNAT := m.samePublicNAT(peer.PublicEndpoint)
+
+	fmt.Printf("[PEER] endpoint selection peer=%s public=%s lan=%s sameNAT=%v local_endpoints=%v\n",
+		peer.Name, direct, lan, sameNAT, peer.LocalEndpoints)
+
+	if sameNAT {
+		// Same public NAT — hairpin via public IP will NEVER work.
+		// Use LAN if available; otherwise return empty to trigger relay fallback.
+		if lan != "" {
+			return lan, "lan"
+		}
+		// Don't return direct — it's our own public IP, hairpin fails.
+		fmt.Printf("[PEER] same NAT detected for %s but no LAN endpoint — will try relay\n", peer.Name)
+		return "", ""
 	}
 	if direct != "" {
 		return direct, "p2p"

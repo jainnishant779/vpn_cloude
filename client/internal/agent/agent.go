@@ -194,13 +194,23 @@ func (a *Agent) Start() error {
 	}
 
 	localEndpoints := getLocalIPsWithPort(wgPort)
+	log.Info().Strs("local_endpoints", localEndpoints).Msg("discovered local endpoints")
+
 	if useMemberToken {
+		// Announce to Redis (local_endpoints + public_endpoint)
 		if err := a.apiClient.MemberAnnounce(a.config.MemberID, api_client.MemberAnnounceRequest{
 			PublicEndpoint: endpoint,
 			LocalEndpoints: localEndpoints,
 		}); err != nil {
 			log.Warn().Err(err).Msg("agent start: member announce failed (non-fatal)")
 		}
+		// Immediate heartbeat to populate DB with local_endpoints NOW.
+		// Without this, DB has empty local_endpoints for 30s after join,
+		// and peers that sync during that window can't discover our LAN IPs.
+		_ = a.apiClient.MemberHeartbeat(a.config.MemberID, api_client.MemberHeartbeatRequest{
+			PublicEndpoint: endpoint,
+			LocalEndpoints: localEndpoints,
+		})
 	} else {
 		if endpoint != "" {
 			if err := a.apiClient.Announce(api_client.AnnounceRequest{
@@ -212,6 +222,11 @@ func (a *Agent) Start() error {
 				log.Warn().Err(err).Msg("agent start: announce failed (non-fatal)")
 			}
 		}
+		// Immediate heartbeat
+		_ = a.apiClient.Heartbeat(a.config.NetworkID, peerID, api_client.PeerStatus{
+			PublicEndpoint: endpoint,
+			LocalEndpoints: localEndpoints,
+		})
 	}
 
 	if a.config.VNCPort > 0 {
