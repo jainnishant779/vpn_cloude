@@ -158,7 +158,14 @@ func normalizePublicHostCandidate(raw string) (string, bool) {
 	}
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return "", false
+		// If split fails, it might be a naked host/IP.
+		host = strings.Trim(strings.TrimSpace(endpoint), "[]")
+	}
+	// Final safety check: if host still has a colon, it's not a naked IPv4/hostname.
+	// We only allow IPv6 if bracketed, but here we want to strip any trailing :port
+	// that might have survived.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 	return strings.TrimSpace(host), true
 }

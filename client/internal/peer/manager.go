@@ -449,11 +449,21 @@ func (m *PeerManager) resolveRelayEndpoint(peerID string) (string, error) {
 	}
 
 	host := strings.TrimSpace(relayInfo.RelayHost)
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
-			host = h
+	// If host contains a port (like "52.72.76.125:3478"), strip it.
+	// We will add the explicit port from relayInfo.RelayPort later.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else {
+		// In case of IPv6 without brackets but with port, or just malformed host:port:port
+		if lastColon := strings.LastIndex(host, ":"); lastColon > 0 {
+			// If it has multiple colons, it might be IPv6. If it has exactly one, it's host:port.
+			if strings.Count(host, ":") == 1 {
+				host = host[:lastColon]
+			}
 		}
 	}
+	host = strings.Trim(host, "[]")
+
 	if isInternalHostName(host) {
 		if h, _, splitErr := net.SplitHostPort(strings.TrimSpace(relayInfo.RelayEndpoint)); splitErr == nil && !isInternalHostName(h) {
 			host = h
