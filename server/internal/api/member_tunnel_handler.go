@@ -93,6 +93,10 @@ func (h *MemberTunnelHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 }
 
 // Peers — GET /api/v1/members/{mid}/peers
+// Merges DB peer data with fresh Redis announce data so that clients
+// receive up-to-date public_endpoint and local_endpoints for each peer.
+// Without this merge, same-NAT LAN detection cannot work because the
+// DB only stores the last heartbeat endpoint, not the latest announce.
 func (h *MemberTunnelHandler) Peers(w http.ResponseWriter, r *http.Request) {
 	peer := h.authMember(w, r)
 	if peer == nil {
@@ -104,8 +108,47 @@ func (h *MemberTunnelHandler) Peers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list peers")
 		return
 	}
-	result := make([]models.Peer, 0, len(peers))
+
+	// Build map for Redis merge
+	peerByID := make(map[string]models.Peer, len(peers))
 	for _, p := range peers {
+		peerByID[p.ID] = p
+	}
+
+	// Merge Redis announce data (freshest local_endpoints + public_endpoint)
+	if h.redis != nil {
+		indexKey := fmt.Sprintf("coord:network:%s:peers", peer.NetworkID)
+		peerIDs, redisErr := h.redis.SMembers(r.Context(), indexKey).Result()
+		if redisErr == nil {
+			for _, peerID := range peerIDs {
+				entryKey := fmt.Sprintf("coord:announce:%s:%s", peer.NetworkID, peerID)
+				raw, getErr := h.redis.Get(r.Context(), entryKey).Result()
+				if getErr != nil {
+					continue
+				}
+				var entry struct {
+					PeerID         string   `json:"peer_id"`
+					PublicEndpoint string   `json:"public_endpoint"`
+					LocalEndpoints []string `json:"local_endpoints"`
+				}
+				if json.Unmarshal([]byte(raw), &entry) != nil {
+					continue
+				}
+				if p, exists := peerByID[entry.PeerID]; exists {
+					if entry.PublicEndpoint != "" {
+						p.PublicEndpoint = entry.PublicEndpoint
+					}
+					if len(entry.LocalEndpoints) > 0 {
+						p.LocalEndpoints = entry.LocalEndpoints
+					}
+					peerByID[entry.PeerID] = p
+				}
+			}
+		}
+	}
+
+	result := make([]models.Peer, 0, len(peerByID))
+	for _, p := range peerByID {
 		if p.ID == peer.ID {
 			continue
 		}

@@ -211,24 +211,6 @@ func (m *PeerManager) syncPeersOnce() error {
 }
 
 // preferIPv4 returns the best IPv4 endpoint, never falling back to unreachable IPv6.
-// getMyPublicIP returns this device's outbound public-facing IP.
-// Used to detect same-NAT peers so we can prefer local endpoints.
-func getMyPublicIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	_, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return ""
-	}
-	// This gives our LAN IP, not public IP.
-	// For public IP detection, use the cached endpoint from agent.
-	// Return empty to disable same-NAT detection if we can't determine it.
-	return ""
-}
-
 func preferIPv4(publicEndpoint string, localEndpoints []string, tunCIDR string) string {
 	if endpoint := normalizePublicEndpoint(publicEndpoint); endpoint != "" {
 		return endpoint

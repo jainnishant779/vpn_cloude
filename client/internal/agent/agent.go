@@ -232,6 +232,11 @@ func (a *Agent) Start() error {
 	if useMemberToken {
 		a.peerMgr.SetMemberID(peerID)
 	}
+	// Feed our public endpoint to PeerManager so samePublicNAT() can detect
+	// peers behind the same NAT and prefer LAN endpoints over hairpin.
+	if endpoint != "" {
+		a.peerMgr.SetLocalPublicEndpoint(endpoint)
+	}
 	a.peerMgr.SetSyncInterval(a.peerSyncInterval())
 	a.peerMgr.Start()
 
@@ -342,11 +347,17 @@ func (a *Agent) sendMemberHeartbeat() error {
 	wgPort := a.currentWGPort()
 	localEndpoints := getLocalIPsWithPort(wgPort)
 
-	if changed {
-		_ = a.apiClient.MemberAnnounce(memberID, api_client.MemberAnnounceRequest{
-			PublicEndpoint: endpoint,
-			LocalEndpoints: localEndpoints,
-		})
+	// Always re-announce to keep Redis data fresh (TTL=60s, heartbeat=30s).
+	// Without this, Redis expires after initial announce and peers lose
+	// each other's local_endpoints — breaking same-NAT LAN connectivity.
+	_ = a.apiClient.MemberAnnounce(memberID, api_client.MemberAnnounceRequest{
+		PublicEndpoint: endpoint,
+		LocalEndpoints: localEndpoints,
+	})
+
+	// Keep PeerManager's public endpoint in sync for samePublicNAT detection
+	if a.peerMgr != nil {
+		a.peerMgr.SetLocalPublicEndpoint(endpoint)
 	}
 
 	stats := a.tunnel.GetStats()
@@ -380,13 +391,16 @@ func (a *Agent) sendHeartbeat() error {
 	wgPort := a.currentWGPort()
 	localEndpoints := getLocalIPsWithPort(wgPort)
 
-	if changed {
-		_ = a.apiClient.Announce(api_client.AnnounceRequest{
-			PeerID:         peerID,
-			NetworkID:      a.config.NetworkID,
-			PublicEndpoint: endpoint,
-			LocalEndpoints: localEndpoints,
-		})
+	// Always re-announce to keep Redis fresh (TTL=60s, heartbeat=30s)
+	_ = a.apiClient.Announce(api_client.AnnounceRequest{
+		PeerID:         peerID,
+		NetworkID:      a.config.NetworkID,
+		PublicEndpoint: endpoint,
+		LocalEndpoints: localEndpoints,
+	})
+
+	if a.peerMgr != nil {
+		a.peerMgr.SetLocalPublicEndpoint(endpoint)
 	}
 
 	stats := a.tunnel.GetStats()
