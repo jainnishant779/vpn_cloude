@@ -219,7 +219,7 @@ func getMyPublicIP() string {
 		return ""
 	}
 	defer conn.Close()
-	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	_, ok := conn.LocalAddr().(*net.UDPAddr)
 	if !ok {
 		return ""
 	}
