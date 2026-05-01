@@ -352,7 +352,7 @@ func (a *Agent) sendMemberHeartbeat() error {
 		return fmt.Errorf("send member heartbeat: member_id empty")
 	}
 
-	fresh, changed, err := a.refreshEndpointIfNeeded(false)
+	fresh, _, err := a.refreshEndpointIfNeeded(false)
 	if err != nil {
 		log.Warn().Err(err).Msg("member heartbeat: endpoint refresh failed")
 	} else if fresh != "" {
@@ -396,7 +396,7 @@ func (a *Agent) sendHeartbeat() error {
 		return fmt.Errorf("send heartbeat: peer id is empty")
 	}
 
-	fresh, changed, err := a.refreshEndpointIfNeeded(false)
+	fresh, _, err := a.refreshEndpointIfNeeded(false)
 	if err != nil {
 		log.Warn().Err(err).Msg("heartbeat: endpoint refresh failed")
 	} else if fresh != "" {
