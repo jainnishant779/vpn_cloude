@@ -193,34 +193,32 @@ func startDaemon() {
 		os.Exit(1)
 	}
 	
-	// Check if running as Windows Service
-	isService := os.Getenv("QUICKTUNNEL_SERVICE") == "1"
-	if isService {
-		startAgentBackground(cfg)
-	} else {
-		startAgent(cfg)
-	}
+	// ALWAYS run in background mode
+	// Windows Service Manager doesn't have stdin/stdout, so this will run silently
+	startAgentBackground(cfg)
 }
 
 func startAgentBackground(cfg *config.Config) {
-	// Background mode for service - don't wait for console input
+	// Background mode - runs as Windows Service
+	// Logs to file only (no console output)
 	a := agent.NewAgent(cfg)
 
 	if err := a.Start(); err != nil {
 		log.Fatal().Err(err).Msg("failed to start agent")
 	}
 
-	log.Info().Str("virtual_ip", cfg.VirtualIP).Msg("QuickTunnel started")
+	log.Info().Str("virtual_ip", cfg.VirtualIP).Msg("QuickTunnel agent started in background mode")
 
-	// Keep running
+	// Keep running forever (until signal or service stop)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Info().Msg("shutting down")
+	log.Info().Msg("received shutdown signal")
 	if err := a.Stop(); err != nil {
-		log.Warn().Err(err).Msg("stop error")
+		log.Warn().Err(err).Msg("error during shutdown")
 	}
+	log.Info().Msg("QuickTunnel agent stopped")
 }
 
 func startAgent(cfg *config.Config) {
@@ -268,7 +266,7 @@ func installService() {
 
 	fmt.Printf("  Installing %s as Windows service...\n", appName)
 
-	// Create service with QUICKTUNNEL_SERVICE env var
+	// Create service: runs "quicktunnel.exe start" which runs in background mode
 	binpath := fmt.Sprintf(`"%s" start`, absPath)
 	out, err := exec.Command("sc", "create", serviceName,
 		"binpath=", binpath,
@@ -280,34 +278,35 @@ func installService() {
 		os.Exit(1)
 	}
 
-	// Set environment variable for background mode
-	_ = exec.Command("reg", "add",
-		"HKLM\\SYSTEM\\CurrentControlSet\\Services\\"+serviceName+"\\Parameters",
-		"/v", "Environment",
-		"/t", "REG_MULTI_SZ",
-		"/d", "QUICKTUNNEL_SERVICE=1",
-		"/f").Run()
-
 	// Set description
 	_ = exec.Command("sc", "description", serviceName,
 		"QuickTunnel VPN — ZeroTier-style mesh networking").Run()
 
-	// Set recovery (restart on failure)
+	// Set recovery (restart on failure after 5, 10, then 30 seconds)
 	_ = exec.Command("sc", "failure", serviceName,
 		"reset=", "60", "actions=", "restart/5000/restart/10000/restart/30000").Run()
 
-	// Allow service to interact with desktop (for tun device)
-	_ = exec.Command("sc", "config", serviceName,
-		"type=", "own",
-		"interact=", "own").Run()
-
 	// Start service
 	time.Sleep(1 * time.Second)
-	_ = exec.Command("sc", "start", serviceName).Run()
+	out, _ = exec.Command("sc", "start", serviceName).CombinedOutput()
 
-	fmt.Printf("  ✓ Service '%s' installed and started\n", serviceName)
+	// Wait for service to start
+	time.Sleep(2 * time.Second)
+
+	// Check if it's running
+	out, _ = exec.Command("sc", "query", serviceName).CombinedOutput()
+	outStr := string(out)
+	if strings.Contains(outStr, "RUNNING") {
+		fmt.Printf("  ✓ Service '%s' is RUNNING\n", serviceName)
+	} else if strings.Contains(outStr, "START_PENDING") {
+		fmt.Printf("  ✓ Service '%s' is STARTING\n", serviceName)
+	} else {
+		fmt.Printf("  ⚠ Service status: check with: sc query %s\n", serviceName)
+	}
+
 	fmt.Println("  ✓ Will auto-start on boot")
-	fmt.Println("  ✓ Run: sc query QuickTunnelSvc to check status")
+	fmt.Printf("  ✓ Logs: %s\n", logFile)
+	fmt.Printf("  ✓ Check: sc query %s\n", serviceName)
 }
 
 func uninstallService() {
