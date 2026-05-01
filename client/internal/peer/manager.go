@@ -165,7 +165,7 @@ func (m *PeerManager) syncPeersOnce() error {
 		}
 
 		newEndpoint, newConnectedVia := m.selectDirectOrLANEndpoint(peerInfo)
-		if newEndpoint == "" && !m.tunnel.IsWGReady() {
+		if newEndpoint == "" {
 			relayEndpoint, err := m.resolveRelayEndpoint(peerInfo.ID)
 			if err == nil && relayEndpoint != "" {
 				newEndpoint = relayEndpoint
