@@ -115,11 +115,11 @@ func (h *JoinHandler) Join(w http.ResponseWriter, r *http.Request) {
 			MemberID:    existing.ID,
 			MemberToken: existing.MemberToken,
 			Status:      existing.Status,
+			NetworkCIDR: network.CIDR,
 			NetworkName: network.Name,
 		}
 		if existing.Status == "approved" {
 			resp.VirtualIP = existing.VirtualIP
-			resp.NetworkCIDR = network.CIDR
 			resp.Message = "Already approved. Tunnel can be configured."
 		} else if existing.Status == "pending" {
 			resp.Message = "Waiting for network admin to approve your device."
@@ -214,6 +214,7 @@ func (h *JoinHandler) Join(w http.ResponseWriter, r *http.Request) {
 		MemberID:    pending.ID,
 		MemberToken: pending.MemberToken,
 		Status:      "pending",
+		NetworkCIDR: network.CIDR,
 		NetworkName: network.Name,
 		Message:     "Your device is pending approval. Ask the network admin to approve you in the dashboard.",
 	})
