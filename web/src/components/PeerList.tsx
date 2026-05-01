@@ -19,8 +19,7 @@ export default function PeerList({ peers, onConnectVNC, onRemove }: Props) {
             <th className="px-4 py-3">OS</th>
             <th className="px-4 py-3">VNC</th>
             <th className="px-4 py-3">Last Seen</th>
-            <th className="px-4 py-3">VNC</th>
-            <th className="px-4 py-3">Actions</th>
+            <th className="px-4 py-3 text-right">Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -34,21 +33,19 @@ export default function PeerList({ peers, onConnectVNC, onRemove }: Props) {
               <td className="px-4 py-3 text-ink/70">{peer.os || "Unknown"}</td>
               <td className="px-4 py-3">{peer.vnc_available ? `:${peer.vnc_port}` : "Not available"}</td>
               <td className="px-4 py-3 text-ink/70">{peer.last_seen || "-"}</td>
-              <td className="px-4 py-3">
+              <td className="px-4 py-3 flex justify-end gap-2">
                 <button
                   type="button"
                   disabled={!peer.is_online || !peer.vnc_available}
                   onClick={() => onConnectVNC?.(peer)}
-                  className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-zinc-300"
+                  className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-zinc-300 shadow-sm"
                 >
                   Connect VNC
                 </button>
-              </td>
-              <td className="px-4 py-3">
                 <button
                   type="button"
                   onClick={() => { if(window.confirm("Remove " + peer.name + "?")) onRemove?.(peer); }}
-                  className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-600"
+                  className="rounded-lg bg-red-50 px-3 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-100 transition-colors"
                 >
                   Remove
                 </button>

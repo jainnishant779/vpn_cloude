@@ -60,6 +60,8 @@ func main() {
 		err = runInstall(args)
 	case "uninstall":
 		err = runUninstall(args)
+	case "reset":
+		err = runReset(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -536,6 +538,7 @@ COMMANDS:
   vnc       <peer-name>            open VNC to a peer
   install                          install as system startup service
   uninstall                        remove system startup service
+  reset                            completely wipe config and uninstall service (to switch networks)
 
   server     = EC2 IP (default port 3000) or full URL
   network_id = from the dashboard`)
@@ -676,6 +679,44 @@ func uninstallWindowsService() error {
 		return fmt.Errorf("uninstall: sc delete: %w\n%s\n  Try running as Administrator", err, string(out))
 	}
 	fmt.Println("✓ QuickTunnel service removed")
+	return nil
+}
+
+func runReset(args []string) error {
+	fmt.Println("Resetting QuickTunnel configuration...")
+
+	// 1. Stop if running
+	_ = runDown(nil)
+
+	// 2. Uninstall service based on OS
+	switch runtime.GOOS {
+	case "linux":
+		_ = uninstallSystemdService()
+	case "windows":
+		_ = uninstallWindowsService()
+	}
+
+	// 3. Delete config file
+	cfgPath, err := config.ConfigPath()
+	if err == nil {
+		if err := os.Remove(cfgPath); err == nil {
+			fmt.Printf("✓ Removed configuration file (%s)\n", cfgPath)
+		} else if !os.IsNotExist(err) {
+			fmt.Printf("⚠ Failed to remove config file: %v\n", err)
+		} else {
+			fmt.Println("✓ No configuration file found")
+		}
+	}
+
+	// 4. Optionally delete global config file in linux
+	if runtime.GOOS == "linux" {
+		if err := os.Remove("/etc/quicktunnel/config.json"); err == nil {
+			fmt.Println("✓ Removed global configuration file (/etc/quicktunnel/config.json)")
+		}
+	}
+
+	fmt.Println("\n✓ QuickTunnel has been completely reset.")
+	fmt.Println("You can now join a new network: quicktunnel join <server> <network_id>")
 	return nil
 }
 
