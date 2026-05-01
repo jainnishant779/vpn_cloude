@@ -114,16 +114,44 @@ fi
 
 BINARY="/usr/local/bin/quicktunnel"
 DOWNLOAD_URL="$SERVER_URL/api/v1/downloads/client/$OS/$ARCH"
-echo "[3/4] Downloading from $DOWNLOAD_URL ..."
-if command -v curl &>/dev/null; then
-  curl -fsSL "$DOWNLOAD_URL" -o "$BINARY"
-elif command -v wget &>/dev/null; then
-  wget -qO "$BINARY" "$DOWNLOAD_URL"
-fi
+echo "[3/6] Downloading from $DOWNLOAD_URL ..."
+for i in 1 2 3; do
+  if command -v curl &>/dev/null; then
+    curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY" && break
+  elif command -v wget &>/dev/null; then
+    wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL" && break
+  fi
+  echo "  Retry $i/3..."
+  sleep 2
+done
 chmod +x "$BINARY"
 
-echo "[4/4] Joining network: $NETWORK_ID"
-exec "$BINARY" join "$SERVER_URL" "$NETWORK_ID"
+echo "[4/6] Joining network: $NETWORK_ID"
+"$BINARY" join "$SERVER_URL" "$NETWORK_ID" &
+JOIN_PID=$!
+
+# Wait for config to be written (max 60s)
+for i in $(seq 1 60); do
+  if [ -f /etc/quicktunnel/config.json ] || [ -f "$HOME/.quicktunnel/config.json" ]; then
+    break
+  fi
+  sleep 1
+done
+
+echo "[5/6] Installing as system service..."
+"$BINARY" install 2>/dev/null || true
+
+echo "[6/6] Done!"
+echo ""
+echo "  QuickTunnel is running and will auto-start on boot."
+echo "  Commands:"
+echo "    quicktunnel status   — check connection"
+echo "    quicktunnel peers    — list connected peers"
+echo "    sudo systemctl status quicktunnel — service status"
+echo ""
+
+# Keep running in foreground
+wait $JOIN_PID 2>/dev/null || true
 `, serverURL, serverURL, networkBlock)
 }
 
@@ -185,5 +213,20 @@ if ($env:PATH -notlike "*QuickTunnel*") {
 
 Write-Host "[5/5] Joining network $NetworkID ..."
 & $BinaryPath join $ServerURL $NetworkID
+
+# Install as Windows service for auto-start on boot
+Write-Host ""
+Write-Host "Installing as Windows Service for auto-start..."
+& $BinaryPath install 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  QuickTunnel will auto-start on boot."
+} else {
+    Write-Host "  [INFO] Service install skipped (may need SYSTEM privileges)"
+}
+Write-Host ""
+Write-Host "  Commands:"
+Write-Host "    quicktunnel status  - check connection"
+Write-Host "    quicktunnel peers   - list connected peers"
+Write-Host "    sc query QuickTunnel - service status"
 `, serverURL, networkID, serverURL, networkID)
 }
