@@ -172,19 +172,22 @@ $DownloadURL = "$ServerURL/api/v1/downloads/client/windows/amd64"
 Write-Host "[1/5] Setting up directories..."
 New-Item -ItemType Directory -Force -Path $QtDir | Out-Null
 
-Write-Host "[2/5] Installing WireGuard (required for full TCP/UDP support)..."
+Write-Host "[2/5] Installing WireGuard (required)..."
 if (-not (Test-Path "$WGPath\wireguard.exe")) {
     $wgInstaller = "$env:TEMP\wireguard-installer.exe"
-    Write-Host "      Downloading WireGuard installer..."
-    Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" -OutFile $wgInstaller -UseBasicParsing
-    Write-Host "      Installing WireGuard (may open UAC prompt)..."
+    if (-not (Test-Path $wgInstaller)) {
+        Write-Host "      Downloading WireGuard installer (may take 30-60s)..."
+        Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" -OutFile $wgInstaller -UseBasicParsing -TimeoutSec 300
+    } else {
+        Write-Host "      Using cached WireGuard installer."
+    }
+    Write-Host "      Installing WireGuard..."
     Start-Process -FilePath $wgInstaller -ArgumentList "/S" -Wait
-    Write-Host "      WireGuard installed."
+    Write-Host "      ✓ WireGuard installed"
 } else {
-    Write-Host "      WireGuard already installed."
+    Write-Host "      ✓ WireGuard already installed"
 }
 
-# Add WireGuard to PATH so wg.exe is accessible
 if ($env:PATH -notlike "*WireGuard*") {
     $env:PATH += ";$WGPath"
     [Environment]::SetEnvironmentVariable("PATH", "$env:PATH", "Machine")
@@ -193,40 +196,81 @@ if ($env:PATH -notlike "*WireGuard*") {
 Write-Host "[3/5] Installing WinTun driver..."
 if (-not (Test-Path $WintunPath)) {
     $wintunZip = "$env:TEMP\wintun.zip"
-    Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -UseBasicParsing
+    if (-not (Test-Path $wintunZip)) {
+        Write-Host "      Downloading WinTun driver..."
+        Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -UseBasicParsing -TimeoutSec 120
+    } else {
+        Write-Host "      Using cached WinTun driver."
+    }
     Expand-Archive -Path $wintunZip -DestinationPath "$env:TEMP\wintun" -Force
     Copy-Item "$env:TEMP\wintun\wintun\bin\amd64\wintun.dll" -Destination $WintunPath -Force
-    Write-Host "      WinTun installed."
+    Write-Host "      ✓ WinTun installed"
 } else {
-    Write-Host "      WinTun already present."
+    Write-Host "      ✓ WinTun already present"
 }
 
-Write-Host "[4/5] Downloading QuickTunnel..."
-Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
-Invoke-WebRequest -Uri $DownloadURL -OutFile $BinaryPath -UseBasicParsing
-Write-Host "      Saved to $BinaryPath"
+Write-Host "[4/5] Downloading QuickTunnel client..."
+$localBinary = "$env:TEMP\quicktunnel.exe"
+if ((Test-Path $BinaryPath) -and (Test-Path $localBinary)) {
+    Write-Host "      ✓ QuickTunnel already present, skipping download"
+} else {
+    Write-Host "      Downloading client binary (may take 30-60s)..."
+    if (Test-Path "$env:TEMP\quicktunnel.exe") { Remove-Item "$env:TEMP\quicktunnel.exe" -Force }
+    Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
+    
+    $retries = 3
+    $downloaded = $false
+    for ($i = 1; $i -le $retries; $i++) {
+        try {
+            Invoke-WebRequest -Uri $DownloadURL -OutFile $localBinary -UseBasicParsing -TimeoutSec 300
+            $downloaded = $true
+            Write-Host "      ✓ Downloaded successfully"
+            break
+        } catch {
+            Write-Host "      Download attempt $i/$retries failed"
+            if ($i -lt $retries) {
+                Write-Host "      Retrying in 5 seconds..."
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+    
+    if ($downloaded) {
+        Copy-Item $localBinary -Destination $BinaryPath -Force
+    } else {
+        Write-Host "ERROR: Failed to download QuickTunnel after $retries attempts" -ForegroundColor Red
+        exit 1
+    }
+}
 
 if ($env:PATH -notlike "*QuickTunnel*") {
-    [Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$QtDir", "Machine")
+    try {
+        $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+        if ($currentPath -notlike "*$QtDir*") {
+            [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$QtDir", "Machine")
+        }
+    } catch { }
     $env:PATH += ";$QtDir"
 }
 
-Write-Host "[5/5] Joining network $NetworkID ..."
+Write-Host "[5/5] Starting QuickTunnel..."
 & $BinaryPath join $ServerURL $NetworkID
 
-# Install as Windows service for auto-start on boot
 Write-Host ""
 Write-Host "Installing as Windows Service for auto-start..."
-& $BinaryPath install 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  QuickTunnel will auto-start on boot."
-} else {
-    Write-Host "  [INFO] Service install skipped (may need SYSTEM privileges)"
-}
+& $BinaryPath install 2>&1 | Where-Object { -not ($_ -like "*error*") } | Out-Null
+
 Write-Host ""
-Write-Host "  Commands:"
-Write-Host "    quicktunnel status  - check connection"
-Write-Host "    quicktunnel peers   - list connected peers"
-Write-Host "    sc query QuickTunnel - service status"
+Write-Host "═══════════════════════════════════════════════"
+Write-Host "✓ QuickTunnel is ready!"
+Write-Host "═══════════════════════════════════════════════"
+Write-Host ""
+Write-Host "Commands:"
+Write-Host "  quicktunnel status       - check connection"
+Write-Host "  quicktunnel peers        - list connected peers"
+Write-Host "  sc query QuickTunnelSvc  - check service status"
+Write-Host ""
+Write-Host "Service will auto-start on reboot."
+Write-Host ""
 `, serverURL, networkID, serverURL, networkID)
 }

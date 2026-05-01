@@ -192,7 +192,35 @@ func startDaemon() {
 		fmt.Printf("  No config found. Run: quicktunnel-win.exe join <server> <network_id>\n")
 		os.Exit(1)
 	}
-	startAgent(cfg)
+	
+	// Check if running as Windows Service
+	isService := os.Getenv("QUICKTUNNEL_SERVICE") == "1"
+	if isService {
+		startAgentBackground(cfg)
+	} else {
+		startAgent(cfg)
+	}
+}
+
+func startAgentBackground(cfg *config.Config) {
+	// Background mode for service - don't wait for console input
+	a := agent.NewAgent(cfg)
+
+	if err := a.Start(); err != nil {
+		log.Fatal().Err(err).Msg("failed to start agent")
+	}
+
+	log.Info().Str("virtual_ip", cfg.VirtualIP).Msg("QuickTunnel started")
+
+	// Keep running
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	log.Info().Msg("shutting down")
+	if err := a.Stop(); err != nil {
+		log.Warn().Err(err).Msg("stop error")
+	}
 }
 
 func startAgent(cfg *config.Config) {
@@ -240,9 +268,10 @@ func installService() {
 
 	fmt.Printf("  Installing %s as Windows service...\n", appName)
 
-	// Create service
+	// Create service with QUICKTUNNEL_SERVICE env var
+	binpath := fmt.Sprintf(`"%s" start`, absPath)
 	out, err := exec.Command("sc", "create", serviceName,
-		"binpath=", fmt.Sprintf(`"%s" start`, absPath),
+		"binpath=", binpath,
 		"start=", "auto",
 		"DisplayName=", appName+" VPN Service",
 	).CombinedOutput()
@@ -250,6 +279,14 @@ func installService() {
 		fmt.Printf("  Failed: %s\n", strings.TrimSpace(string(out)))
 		os.Exit(1)
 	}
+
+	// Set environment variable for background mode
+	_ = exec.Command("reg", "add",
+		"HKLM\\SYSTEM\\CurrentControlSet\\Services\\"+serviceName+"\\Parameters",
+		"/v", "Environment",
+		"/t", "REG_MULTI_SZ",
+		"/d", "QUICKTUNNEL_SERVICE=1",
+		"/f").Run()
 
 	// Set description
 	_ = exec.Command("sc", "description", serviceName,
@@ -259,11 +296,18 @@ func installService() {
 	_ = exec.Command("sc", "failure", serviceName,
 		"reset=", "60", "actions=", "restart/5000/restart/10000/restart/30000").Run()
 
+	// Allow service to interact with desktop (for tun device)
+	_ = exec.Command("sc", "config", serviceName,
+		"type=", "own",
+		"interact=", "own").Run()
+
 	// Start service
+	time.Sleep(1 * time.Second)
 	_ = exec.Command("sc", "start", serviceName).Run()
 
 	fmt.Printf("  ✓ Service '%s' installed and started\n", serviceName)
 	fmt.Println("  ✓ Will auto-start on boot")
+	fmt.Println("  ✓ Run: sc query QuickTunnelSvc to check status")
 }
 
 func uninstallService() {
