@@ -321,32 +321,16 @@ for i in 1 2 3; do
 done
 chmod +x "$BINARY"
 
-echo "[4/6] Joining network: $NETWORK_ID"
-"$BINARY" join "$SERVER_URL" "$NETWORK_ID" &
-JOIN_PID=$!
+echo "[4/4] Joining network: $NETWORK_ID"
+"$BINARY" join --install "$SERVER_URL" "$NETWORK_ID"
 
-# Wait for config to be written (max 60s)
-for i in $(seq 1 60); do
-  if [ -f /etc/quicktunnel/config.json ] || [ -f "$HOME/.quicktunnel/config.json" ]; then
-    break
-  fi
-  sleep 1
-done
-
-echo "[5/6] Installing as system service..."
-"$BINARY" install 2>/dev/null || true
-
-echo "[6/6] Done!"
 echo ""
-echo "  QuickTunnel is running and will auto-start on boot."
+echo "  QuickTunnel is installed and will auto-start on boot."
 echo "  Commands:"
 echo "    quicktunnel status   — check connection"
 echo "    quicktunnel peers    — list connected peers"
 echo "    sudo systemctl status quicktunnel — service status"
 echo ""
-
-# Keep running in foreground
-wait $JOIN_PID 2>/dev/null || true
 `, serverURL, serverURL, networkBlock)
 }
 
@@ -448,12 +432,8 @@ if ($env:PATH -notlike "*QuickTunnel*") {
     $env:PATH += ";$QtDir"
 }
 
-Write-Host "[5/5] Starting QuickTunnel..."
-& $BinaryPath join $ServerURL $NetworkID
-
-Write-Host ""
-Write-Host "Installing as Windows Service for auto-start..."
-& $BinaryPath install 2>&1 | Where-Object { -not ($_ -like "*error*") } | Out-Null
+Write-Host "[5/5] Joining network $NetworkID and installing service..."
+& $BinaryPath join --install $ServerURL $NetworkID
 
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════"

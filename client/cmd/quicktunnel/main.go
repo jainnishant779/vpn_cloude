@@ -94,6 +94,7 @@ func normalizeServerURL(raw string) string {
 func runJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	nameFlag := fs.String("name", "", "Device name (optional)")
+	installFlag := fs.Bool("install", false, "Install as system service after joining")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("join: %w", err)
 	}
@@ -276,8 +277,13 @@ approved:
 		return fmt.Errorf("join: save config: %w", err)
 	}
 	fmt.Println("✓ Config saved")
-	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)\n")
 
+	if *installFlag {
+		fmt.Println("\nInstalling as system service...")
+		return runInstall(nil)
+	}
+
+	fmt.Println("\nStarting tunnel... (Ctrl+C to disconnect)\n")
 	return startAgent(cfg)
 }
 
