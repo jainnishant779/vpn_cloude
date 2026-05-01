@@ -31,7 +31,9 @@ export interface Peer {
   vnc_port: number;
   vnc_available: boolean;
   relay_id: string;
+  status?: string;
   last_seen?: string;
+  created_at?: string;
 }
 
 export interface ApiEnvelope<T> {

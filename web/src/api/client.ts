@@ -170,6 +170,20 @@ export const networkApi = {
 
   async kickMember(networkId: string, memberId: string) {
     await api.delete(`/api/v1/networks/${networkId}/members/${memberId}`);
+  },
+
+  async getMembers(networkId: string) {
+    const response = await api.get<ApiEnvelope<Peer[]>>(`/api/v1/networks/${networkId}/members`);
+    return response.data.data;
+  },
+
+  async approveMember(networkId: string, memberId: string) {
+    const response = await api.post<ApiEnvelope<Peer>>(`/api/v1/networks/${networkId}/members/${memberId}/approve`);
+    return response.data.data;
+  },
+
+  async rejectMember(networkId: string, memberId: string) {
+    await api.post(`/api/v1/networks/${networkId}/members/${memberId}/reject`);
   }
 };
 
