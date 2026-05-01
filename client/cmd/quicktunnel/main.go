@@ -640,47 +640,39 @@ func uninstallSystemdService() error {
 }
 
 func installWindowsService(exePath string) error {
-	createCmdArgs := []string{
-		"create", "QuickTunnel",
-		"binPath=", fmt.Sprintf("\"%s\" up", exePath),
-		"start=", "auto",
-		"DisplayName=", "QuickTunnel VPN Agent",
-	}
-	out, err := exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
+	// Use schtasks to run the console app as SYSTEM on boot without needing SCM integration
+	uninstallWindowsService()
+
+	cmdStr := fmt.Sprintf("\"%s\" up", exePath)
+	out, err := exec.Command("schtasks", "/create", "/tn", "QuickTunnel", "/tr", cmdStr, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f").CombinedOutput()
 	if err != nil {
-		_ = exec.Command("sc.exe", "stop", "QuickTunnel").Run()
-		_ = exec.Command("sc.exe", "delete", "QuickTunnel").Run()
-		time.Sleep(2 * time.Second)
-		out, err = exec.Command("sc.exe", createCmdArgs...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("install: sc create: %w\n%s\n  Try running as Administrator", err, string(out))
-		}
+		return fmt.Errorf("install: schtasks create: %w\n%s\n  Try running as Administrator", err, string(out))
 	}
 
-	_ = exec.Command("sc.exe", "description", "QuickTunnel", "QuickTunnel ZeroTier-style mesh VPN agent").Run()
-	_ = exec.Command("sc.exe", "failure", "QuickTunnel", "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
-
-	if startOut, err := exec.Command("sc.exe", "start", "QuickTunnel").CombinedOutput(); err != nil {
-		fmt.Printf("[WARN] Service created but failed to start: %s\n", string(startOut))
+	if startOut, err := exec.Command("schtasks", "/run", "/tn", "QuickTunnel").CombinedOutput(); err != nil {
+		fmt.Printf("[WARN] Task created but failed to start now: %s\n", string(startOut))
 	}
 
-	fmt.Println("✓ QuickTunnel installed as Windows Service")
-	fmt.Println("  Service name : QuickTunnel")
-	fmt.Println("  Auto-start   : enabled")
-	fmt.Println("  Check status : sc query QuickTunnel")
+	fmt.Println("✓ QuickTunnel installed as Windows Startup Task")
+	fmt.Println("  Task name  : QuickTunnel")
+	fmt.Println("  Auto-start : enabled (on boot as SYSTEM)")
+	fmt.Println("  To verify  : Task Scheduler -> QuickTunnel")
 	return nil
 }
 
 func uninstallWindowsService() error {
-	_ = exec.Command("sc.exe", "stop", "QuickTunnel").Run()
-	time.Sleep(2 * time.Second)
-	out, err := exec.Command("sc.exe", "delete", "QuickTunnel").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("uninstall: sc delete: %w\n%s\n  Try running as Administrator", err, string(out))
+	_ = runDown(nil) // Stop it first
+	_ = exec.Command("schtasks", "/end", "/tn", "QuickTunnel").Run()
+	time.Sleep(1 * time.Second)
+	out, err := exec.Command("schtasks", "/delete", "/tn", "QuickTunnel", "/f").CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "The system cannot find the file specified") {
+		return fmt.Errorf("uninstall: schtasks delete: %w\n%s\n  Try running as Administrator", err, string(out))
 	}
-	fmt.Println("✓ QuickTunnel service removed")
+	fmt.Println("✓ QuickTunnel startup task removed")
 	return nil
 }
+
+
 
 func runReset(args []string) error {
 	fmt.Println("Resetting QuickTunnel configuration...")
