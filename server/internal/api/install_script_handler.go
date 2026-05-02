@@ -238,7 +238,7 @@ $ServerURL   = "%[1]s"
 $NetworkID   = "%[2]s"
 $QtDir       = "$env:ProgramFiles\QuickTunnel"
 $BinaryPath  = "$QtDir\quicktunnel.exe"
-$ConfigDir   = "$QtDir\config"
+$ConfigDir   = "$env:ProgramData\QuickTunnel"
 $ConfigFile  = "$ConfigDir\config.json"
 $WintunPath  = "$QtDir\wintun.dll"
 $WGPath      = "$env:ProgramFiles\WireGuard"
@@ -370,14 +370,13 @@ $joinProc = Start-Process -FilePath $BinaryPath `
     -PassThru -NoNewWindow -RedirectStandardOutput "$QtDir\join_stdout.log" `
     -RedirectStandardError "$QtDir\join_stderr.log"
 
-$userConfig = "$env:USERPROFILE\.quicktunnel\config.json"
 $waited = 0
 Write-Host "      Waiting for config..." -NoNewline
 while ($waited -lt 60) {
     Start-Sleep -Seconds 2
     $waited += 2
     Write-Host "." -NoNewline
-    if (Test-Path $userConfig) { break }
+    if (Test-Path $ConfigFile) { break }
     if ($joinProc.HasExited) { break }
 }
 Write-Host ""
@@ -387,11 +386,10 @@ if (-not $joinProc.HasExited) {
     Start-Sleep -Seconds 1
 }
 
-if (Test-Path $userConfig) {
-    Copy-Item $userConfig -Destination $ConfigFile -Force
+if (Test-Path $ConfigFile) {
     Write-Host "      Config saved: $ConfigFile"
 } else {
-    Write-Host "      [!] Config not found at $userConfig" -ForegroundColor Red
+    Write-Host "      [!] Config not found at $ConfigFile" -ForegroundColor Red
     Write-Host "      Join stdout:" -ForegroundColor Yellow
     if (Test-Path "$QtDir\join_stdout.log") { Get-Content "$QtDir\join_stdout.log" }
     Write-Host "      Join stderr:" -ForegroundColor Yellow
