@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -85,6 +86,14 @@ func Save(cfg *Config) error {
 }
 
 func ConfigPath() (string, error) {
+	if runtime.GOOS == "windows" {
+		programData := strings.TrimSpace(os.Getenv("ProgramData"))
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		return filepath.Join(programData, "QuickTunnel", "config.json"), nil
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("config path: %w", err)
