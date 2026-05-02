@@ -256,6 +256,14 @@ Write-Host ""
 Write-Host "Installing as Windows Service for auto-start..."
 & $BinaryPath install 2>&1 | Where-Object { -not ($_ -like "*error*") } | Out-Null
 
+Write-Host "Verifying startup task..."
+schtasks /query /tn QuickTunnel 1>$null 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "✓ Startup task installed"
+} else {
+    Write-Host "⚠ Startup task missing. Run: quicktunnel install" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════"
 Write-Host "✓ QuickTunnel is ready!"
