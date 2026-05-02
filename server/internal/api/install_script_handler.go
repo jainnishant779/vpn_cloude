@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -11,6 +12,12 @@ import (
 type InstallScriptHandler struct {
 	serverURL string
 }
+
+// validID matches only safe alphanumeric / hyphen / underscore identifiers.
+var validID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// validServerURL matches http(s) URLs without shell-dangerous characters.
+var validServerURL = regexp.MustCompile(`^https?://[a-zA-Z0-9._:/-]+$`)
 
 func NewInstallScriptHandler(serverURL string) *InstallScriptHandler {
 	return &InstallScriptHandler{
@@ -26,11 +33,21 @@ func (h *InstallScriptHandler) deriveServerURL(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://%s", scheme, r.Host)
+	derived := fmt.Sprintf("%s://%s", scheme, r.Host)
+	if !validServerURL.MatchString(derived) {
+		// Fallback: refuse to produce a script with an untrusted host.
+		return ""
+	}
+	return derived
 }
 
 func (h *InstallScriptHandler) ServeScript(w http.ResponseWriter, r *http.Request) {
-	script := buildInstallScript(h.deriveServerURL(r), "")
+	serverURL := h.deriveServerURL(r)
+	if serverURL == "" {
+		http.Error(w, "unable to determine server URL", http.StatusBadRequest)
+		return
+	}
+	script := buildInstallScript(serverURL, "")
 	writeScript(w, script)
 }
 
@@ -40,7 +57,16 @@ func (h *InstallScriptHandler) ServeJoin(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "network_id is required", http.StatusBadRequest)
 		return
 	}
-	script := buildInstallScript(h.deriveServerURL(r), networkID)
+	if !validID.MatchString(networkID) {
+		http.Error(w, "network_id contains invalid characters", http.StatusBadRequest)
+		return
+	}
+	serverURL := h.deriveServerURL(r)
+	if serverURL == "" {
+		http.Error(w, "unable to determine server URL", http.StatusBadRequest)
+		return
+	}
+	script := buildInstallScript(serverURL, networkID)
 	writeScript(w, script)
 }
 
@@ -50,7 +76,16 @@ func (h *InstallScriptHandler) ServeJoinPS1(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "network_id is required", http.StatusBadRequest)
 		return
 	}
-	script := buildPS1Script(h.deriveServerURL(r), networkID)
+	if !validID.MatchString(networkID) {
+		http.Error(w, "network_id contains invalid characters", http.StatusBadRequest)
+		return
+	}
+	serverURL := h.deriveServerURL(r)
+	if serverURL == "" {
+		http.Error(w, "unable to determine server URL", http.StatusBadRequest)
+		return
+	}
+	script := buildPS1Script(serverURL, networkID)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "inline; filename=install.ps1")
 	w.Header().Set("Cache-Control", "no-store")
@@ -101,7 +136,7 @@ echo "[1/5] Platform: $OS/$ARCH"
 
 # ── 2. Cleanup old instance ───────────────────────────────────────────────────
 echo "[2/5] Cleaning up..."
-systemctl stop $SERVICE_NAME 2>/dev/null || true
+systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 pkill -f quicktunnel 2>/dev/null || true
 sleep 1
 ip link delete qtun0 2>/dev/null || true
@@ -120,15 +155,26 @@ fi
 # ── 4. Download binary ────────────────────────────────────────────────────────
 DOWNLOAD_URL="$SERVER_URL/api/v1/downloads/client/$OS/$ARCH"
 echo "[3/5] Downloading from $DOWNLOAD_URL ..."
+DOWNLOAD_SUCCESS=false
 for i in 1 2 3; do
   if command -v curl &>/dev/null; then
-    curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY" && break
+    if curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY"; then
+      DOWNLOAD_SUCCESS=true
+      break
+    fi
   elif command -v wget &>/dev/null; then
-    wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL" && break
+    if wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL"; then
+      DOWNLOAD_SUCCESS=true
+      break
+    fi
   fi
   echo "  Retry $i/3 ..."
   sleep 3
 done
+if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+  echo "ERROR: Failed to download QuickTunnel binary after 3 attempts."
+  exit 1
+fi
 chmod +x "$BINARY"
 echo "      Saved: $BINARY"
 
@@ -136,12 +182,18 @@ echo "      Saved: $BINARY"
 echo "[4/5] Joining network $NETWORK_ID ..."
 
 # Run join once to get config (foreground, short timeout)
-# We use timeout so it saves config then exits
-timeout 30s "$BINARY" join "$SERVER_URL" "$NETWORK_ID" || true
+if ! timeout 30s "$BINARY" join "$SERVER_URL" "$NETWORK_ID"; then
+  echo "[WARN] Join command exited with an error or timed out."
+fi
 
-CONFIG_FILE="$HOME/.quicktunnel/config.json"
+CONFIG_FILE="/root/.quicktunnel/config.json"
+if [ -n "${HOME:-}" ] && [ -f "$HOME/.quicktunnel/config.json" ]; then
+  CONFIG_FILE="$HOME/.quicktunnel/config.json"
+fi
+
 if [ ! -f "$CONFIG_FILE" ]; then
-  CONFIG_FILE="/root/.quicktunnel/config.json"
+  echo "ERROR: Config file not found at $CONFIG_FILE. Join may have failed."
+  exit 1
 fi
 
 echo "[5/5] Installing systemd service..."
@@ -168,8 +220,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable $SERVICE_NAME
-systemctl start $SERVICE_NAME
+systemctl enable "$SERVICE_NAME"
+systemctl start "$SERVICE_NAME"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -271,11 +323,7 @@ if ($env:PATH -notlike "*QuickTunnel*") {
 
 # ── Join network ──────────────────────────────────────────────────────────────
 Write-Host "[5/6] Joining network $NetworkID ..."
-Write-Host "      (This will save config and start tunnel)"
-Write-Host "      Press Ctrl+C after you see 'Tunnel UP' to continue setup"
-Write-Host ""
 
-# Start join in background, wait for config
 $job = Start-Job -ScriptBlock {
     param($bin, $srv, $net)
     & $bin join $srv $net
@@ -292,11 +340,19 @@ while (-not (Test-Path $configPath) -and $waited -lt 60) {
 }
 Write-Host ""
 
+# Clean up the background job
+Stop-Job -Job $job -ErrorAction SilentlyContinue
+Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
 if (Test-Path $configPath) {
     Write-Host "      Config saved: $configPath"
 } else {
-    Write-Host "      [WARN] Config not found, running join directly..."
-    & $BinaryPath join $ServerURL $NetworkID
+    Write-Host "      Config not found, running join directly..."
+    $joinResult = & $BinaryPath join $ServerURL $NetworkID 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Join failed: $joinResult"
+        exit 1
+    }
 }
 
 # ── Install as Windows Scheduled Task (runs on login + after reboot) ──────────
