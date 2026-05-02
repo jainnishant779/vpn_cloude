@@ -280,8 +280,7 @@ if (-not (Test-Path "$WGPath\wireguard.exe")) {
     $wgInstaller = "$env:TEMP\wireguard-installer.exe"
     Write-Host "      Downloading WireGuard installer..."
     try {
-        Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" `
-            -OutFile $wgInstaller -UseBasicParsing -TimeoutSec 300
+        Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" -OutFile $wgInstaller -UseBasicParsing -TimeoutSec 300
         Write-Host "      Installing WireGuard (silent)..."
         Start-Process -FilePath $wgInstaller -ArgumentList "/S" -Wait
         Start-Sleep -Seconds 3
@@ -305,11 +304,9 @@ Write-Host "[4/7] Installing WinTun driver..."
 if (-not (Test-Path $WintunPath)) {
     $wintunZip = "$env:TEMP\wintun.zip"
     try {
-        Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" `
-            -OutFile $wintunZip -UseBasicParsing -TimeoutSec 120
+        Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -UseBasicParsing -TimeoutSec 120
         Expand-Archive -Path $wintunZip -DestinationPath "$env:TEMP\wintun_extract" -Force
-        Copy-Item "$env:TEMP\wintun_extract\wintun\bin\amd64\wintun.dll" `
-            -Destination $WintunPath -Force
+        Copy-Item "$env:TEMP\wintun_extract\wintun\bin\amd64\wintun.dll" -Destination $WintunPath -Force
         Write-Host "      WinTun installed."
     } catch {
         Write-Host "      [WARN] WinTun download failed: $_" -ForegroundColor Yellow
@@ -351,11 +348,9 @@ Write-Host "      Downloading NSSM service manager..."
 if (-not (Test-Path $NssmPath)) {
     $nssmZip = "$env:TEMP\nssm.zip"
     try {
-        Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" `
-            -OutFile $nssmZip -UseBasicParsing -TimeoutSec 120
+        Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip -UseBasicParsing -TimeoutSec 120
         Expand-Archive -Path $nssmZip -DestinationPath "$env:TEMP\nssm_extract" -Force
-        Copy-Item "$env:TEMP\nssm_extract\nssm-2.24\win64\nssm.exe" `
-            -Destination $NssmPath -Force
+        Copy-Item "$env:TEMP\nssm_extract\nssm-2.24\win64\nssm.exe" -Destination $NssmPath -Force
         Write-Host "      NSSM installed."
     } catch {
         Write-Host "      [WARN] NSSM download failed, will use fallback." -ForegroundColor Yellow
@@ -365,10 +360,7 @@ if (-not (Test-Path $NssmPath)) {
 # ── 6. Join network ──────────────────────────────────────────────────────────
 Write-Host "[6/7] Joining network $NetworkID ..."
 
-$joinProc = Start-Process -FilePath $BinaryPath `
-    -ArgumentList "join", $ServerURL, $NetworkID `
-    -PassThru -NoNewWindow -RedirectStandardOutput "$QtDir\join_stdout.log" `
-    -RedirectStandardError "$QtDir\join_stderr.log"
+$joinProc = Start-Process -FilePath $BinaryPath -ArgumentList "join", $ServerURL, $NetworkID -PassThru -NoNewWindow -RedirectStandardOutput "$QtDir\join_stdout.log" -RedirectStandardError "$QtDir\join_stderr.log"
 
 $waited = 0
 Write-Host "      Waiting for config..." -NoNewline
@@ -424,31 +416,17 @@ if (Test-Path $NssmPath) {
 } else {
     Write-Host "      NSSM not available, using fallback method..."
 
-    Start-Process -FilePath $BinaryPath -ArgumentList "up" `
-        -WindowStyle Hidden -WorkingDirectory $QtDir
+    Start-Process -FilePath $BinaryPath -ArgumentList "up" -WindowStyle Hidden -WorkingDirectory $QtDir
 
     $action   = New-ScheduledTaskAction -Execute $BinaryPath -Argument "up" -WorkingDirectory $QtDir
     $triggers = @(
         $(New-ScheduledTaskTrigger -AtLogOn),
         $(New-ScheduledTaskTrigger -AtStartup)
     )
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 1) `
-        -ExecutionTimeLimit ([TimeSpan]::Zero)
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-        -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -RunLevel Highest
 
-    Register-ScheduledTask `
-        -TaskName $ServiceName `
-        -Action $action `
-        -Trigger $triggers `
-        -Settings $settings `
-        -Principal $principal `
-        -Force | Out-Null
+    Register-ScheduledTask -TaskName $ServiceName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
 
     Write-Host "      Detached process started + scheduled task created" -ForegroundColor Green
 }
