@@ -211,36 +211,32 @@ if (-not (Test-Path $WintunPath)) {
 
 Write-Host "[4/5] Downloading QuickTunnel client..."
 $localBinary = "$env:TEMP\quicktunnel.exe"
-if ((Test-Path $BinaryPath) -and (Test-Path $localBinary)) {
-    Write-Host "      ✓ QuickTunnel already present, skipping download"
-} else {
-    Write-Host "      Downloading client binary (may take 30-60s)..."
-    if (Test-Path "$env:TEMP\quicktunnel.exe") { Remove-Item "$env:TEMP\quicktunnel.exe" -Force }
-    Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
-    
-    $retries = 3
-    $downloaded = $false
-    for ($i = 1; $i -le $retries; $i++) {
-        try {
-            Invoke-WebRequest -Uri $DownloadURL -OutFile $localBinary -UseBasicParsing -TimeoutSec 300
-            $downloaded = $true
-            Write-Host "      ✓ Downloaded successfully"
-            break
-        } catch {
-            Write-Host "      Download attempt $i/$retries failed"
-            if ($i -lt $retries) {
-                Write-Host "      Retrying in 5 seconds..."
-                Start-Sleep -Seconds 5
-            }
+Write-Host "      Downloading client binary (may take 30-60s)..."
+if (Test-Path "$env:TEMP\quicktunnel.exe") { Remove-Item "$env:TEMP\quicktunnel.exe" -Force }
+Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
+
+$retries = 3
+$downloaded = $false
+for ($i = 1; $i -le $retries; $i++) {
+    try {
+        Invoke-WebRequest -Uri $DownloadURL -OutFile $localBinary -UseBasicParsing -TimeoutSec 300
+        $downloaded = $true
+        Write-Host "      ✓ Downloaded successfully"
+        break
+    } catch {
+        Write-Host "      Download attempt $i/$retries failed"
+        if ($i -lt $retries) {
+            Write-Host "      Retrying in 5 seconds..."
+            Start-Sleep -Seconds 5
         }
     }
-    
-    if ($downloaded) {
-        Copy-Item $localBinary -Destination $BinaryPath -Force
-    } else {
-        Write-Host "ERROR: Failed to download QuickTunnel after $retries attempts" -ForegroundColor Red
-        exit 1
-    }
+}
+
+if ($downloaded) {
+    Copy-Item $localBinary -Destination $BinaryPath -Force
+} else {
+    Write-Host "ERROR: Failed to download QuickTunnel after $retries attempts" -ForegroundColor Red
+    exit 1
 }
 
 if ($env:PATH -notlike "*QuickTunnel*") {
@@ -254,7 +250,11 @@ if ($env:PATH -notlike "*QuickTunnel*") {
 }
 
 Write-Host "[5/5] Joining network $NetworkID and installing service..."
-& $BinaryPath join --install $ServerURL $NetworkID
+& $BinaryPath join $ServerURL $NetworkID
+
+Write-Host ""
+Write-Host "Installing as Windows Service for auto-start..."
+& $BinaryPath install 2>&1 | Where-Object { -not ($_ -like "*error*") } | Out-Null
 
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════"
