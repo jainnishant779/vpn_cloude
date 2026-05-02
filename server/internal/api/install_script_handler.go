@@ -79,13 +79,16 @@ fi`, serverURL)
 	}
 
 	return fmt.Sprintf(`#!/usr/bin/env bash
-# QuickTunnel — zero-touch installer
+# QuickTunnel — zero-touch installer + service setup
 # Usage: curl %s/join/<network_id> | sudo bash
 set -euo pipefail
 
 SERVER_URL="%s"
+BINARY="/usr/local/bin/quicktunnel"
+SERVICE_NAME="quicktunnel"
 %s
 
+# ── 1. Platform detection ─────────────────────────────────────────────────────
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
@@ -94,16 +97,18 @@ case "$ARCH_RAW" in
   armv7*|armv6*) ARCH="armv7" ;;
   *) echo "Unsupported arch: $ARCH_RAW"; exit 1 ;;
 esac
+echo "[1/5] Platform: $OS/$ARCH"
 
-echo "[1/4] Platform: $OS/$ARCH"
-
-echo "[2/4] Stopping old instance..."
+# ── 2. Cleanup old instance ───────────────────────────────────────────────────
+echo "[2/5] Cleaning up..."
+systemctl stop $SERVICE_NAME 2>/dev/null || true
 pkill -f quicktunnel 2>/dev/null || true
+sleep 1
 ip link delete qtun0 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
-rm -f /usr/local/bin/quicktunnel
-sleep 1
+rm -f "$BINARY"
 
+# ── 3. WireGuard kernel module ────────────────────────────────────────────────
 if [ "$OS" = "linux" ]; then
   modprobe wireguard 2>/dev/null || true
   if ! command -v wg &>/dev/null; then
@@ -112,51 +117,73 @@ if [ "$OS" = "linux" ]; then
   fi
 fi
 
-BINARY="/usr/local/bin/quicktunnel"
+# ── 4. Download binary ────────────────────────────────────────────────────────
 DOWNLOAD_URL="$SERVER_URL/api/v1/downloads/client/$OS/$ARCH"
-echo "[3/6] Downloading from $DOWNLOAD_URL ..."
+echo "[3/5] Downloading from $DOWNLOAD_URL ..."
 for i in 1 2 3; do
   if command -v curl &>/dev/null; then
     curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY" && break
   elif command -v wget &>/dev/null; then
     wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL" && break
   fi
-  echo "  Retry $i/3..."
-  sleep 2
+  echo "  Retry $i/3 ..."
+  sleep 3
 done
 chmod +x "$BINARY"
+echo "      Saved: $BINARY"
 
-echo "[4/6] Joining network: $NETWORK_ID"
-"$BINARY" join "$SERVER_URL" "$NETWORK_ID" &
-JOIN_PID=$!
+# ── 5. Join + install systemd service ────────────────────────────────────────
+echo "[4/5] Joining network $NETWORK_ID ..."
 
-# Wait for config to be written (max 60s)
-for i in $(seq 1 60); do
-  if [ -f /etc/quicktunnel/config.json ] || [ -f "$HOME/.quicktunnel/config.json" ]; then
-    break
-  fi
-  sleep 1
-done
+# Run join once to get config (foreground, short timeout)
+# We use timeout so it saves config then exits
+timeout 30s "$BINARY" join "$SERVER_URL" "$NETWORK_ID" || true
 
-echo "[5/6] Installing as system service..."
-"$BINARY" install 2>/dev/null || true
+CONFIG_FILE="$HOME/.quicktunnel/config.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+  CONFIG_FILE="/root/.quicktunnel/config.json"
+fi
 
-echo "[6/6] Done!"
+echo "[5/5] Installing systemd service..."
+
+# Create systemd service file
+cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
+[Unit]
+Description=QuickTunnel VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe wireguard
+ExecStart=${BINARY} up
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable $SERVICE_NAME
+systemctl start $SERVICE_NAME
+
 echo ""
-echo "  QuickTunnel is running and will auto-start on boot."
-echo "  Commands:"
-echo "    quicktunnel status   — check connection"
-echo "    quicktunnel peers    — list connected peers"
-echo "    sudo systemctl status quicktunnel — service status"
-echo ""
-
-# Keep running in foreground
-wait $JOIN_PID 2>/dev/null || true
+echo "═══════════════════════════════════════════════"
+echo "✓ QuickTunnel installed and running!"
+echo "  Virtual network: $NETWORK_ID"
+echo "  Service: systemctl status $SERVICE_NAME"
+echo "  Logs: journalctl -u $SERVICE_NAME -f"
+echo "  Peers: quicktunnel peers"
+echo "═══════════════════════════════════════════════"
 `, serverURL, serverURL, networkBlock)
 }
 
 func buildPS1Script(serverURL, networkID string) string {
-    return fmt.Sprintf(`# QuickTunnel — Windows installer
+	return fmt.Sprintf(`# QuickTunnel — Windows installer + auto-start service
 # Run in PowerShell as Administrator:
 # irm %s/join/%s/ps1 | iex
 
@@ -168,113 +195,162 @@ $BinaryPath  = "$QtDir\quicktunnel.exe"
 $WintunPath  = "$QtDir\wintun.dll"
 $WGPath      = "$env:ProgramFiles\WireGuard"
 $DownloadURL = "$ServerURL/api/v1/downloads/client/windows/amd64"
+$TaskName    = "QuickTunnel"
 
-Write-Host "[1/5] Setting up directories..."
+Write-Host "[1/6] Setting up QuickTunnel directory..."
 New-Item -ItemType Directory -Force -Path $QtDir | Out-Null
 
-Write-Host "[2/5] Installing WireGuard (required)..."
+# ── Stop existing ─────────────────────────────────────────────────────────────
+Write-Host "      Stopping existing instance..."
+Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+
+# ── Install WireGuard ─────────────────────────────────────────────────────────
+Write-Host "[2/6] Installing WireGuard..."
 if (-not (Test-Path "$WGPath\wireguard.exe")) {
     $wgInstaller = "$env:TEMP\wireguard-installer.exe"
-    if (-not (Test-Path $wgInstaller)) {
-        Write-Host "      Downloading WireGuard installer (may take 30-60s)..."
+    Write-Host "      Downloading WireGuard installer..."
+    try {
         Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-installer.exe" -OutFile $wgInstaller -UseBasicParsing -TimeoutSec 300
-    } else {
-        Write-Host "      Using cached WireGuard installer."
+        Write-Host "      Installing WireGuard (silent)..."
+        Start-Process -FilePath $wgInstaller -ArgumentList "/S" -Wait
+        Start-Sleep -Seconds 3
+        Write-Host "      WireGuard installed."
+    } catch {
+        Write-Host "      [WARN] WireGuard download failed: $_" -ForegroundColor Yellow
     }
-    Write-Host "      Installing WireGuard..."
-    Start-Process -FilePath $wgInstaller -ArgumentList "/S" -Wait
-    Write-Host "      ✓ WireGuard installed"
 } else {
-    Write-Host "      ✓ WireGuard already installed"
+    Write-Host "      WireGuard already installed."
 }
-
 if ($env:PATH -notlike "*WireGuard*") {
     $env:PATH += ";$WGPath"
-    [Environment]::SetEnvironmentVariable("PATH", "$env:PATH", "Machine")
+    try { [Environment]::SetEnvironmentVariable("PATH", [Environment]::GetEnvironmentVariable("PATH","Machine")+";$WGPath", "Machine") } catch {}
 }
 
-Write-Host "[3/5] Installing WinTun driver..."
+# ── Install WinTun ────────────────────────────────────────────────────────────
+Write-Host "[3/6] Installing WinTun driver..."
 if (-not (Test-Path $WintunPath)) {
     $wintunZip = "$env:TEMP\wintun.zip"
-    if (-not (Test-Path $wintunZip)) {
-        Write-Host "      Downloading WinTun driver..."
+    try {
         Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $wintunZip -UseBasicParsing -TimeoutSec 120
-    } else {
-        Write-Host "      Using cached WinTun driver."
+        Expand-Archive -Path $wintunZip -DestinationPath "$env:TEMP\wintun_extract" -Force
+        Copy-Item "$env:TEMP\wintun_extract\wintun\bin\amd64\wintun.dll" -Destination $WintunPath -Force
+        Write-Host "      WinTun installed."
+    } catch {
+        Write-Host "      [WARN] WinTun download failed: $_" -ForegroundColor Yellow
     }
-    Expand-Archive -Path $wintunZip -DestinationPath "$env:TEMP\wintun" -Force
-    Copy-Item "$env:TEMP\wintun\wintun\bin\amd64\wintun.dll" -Destination $WintunPath -Force
-    Write-Host "      ✓ WinTun installed"
 } else {
-    Write-Host "      ✓ WinTun already present"
+    Write-Host "      WinTun already present."
 }
 
-Write-Host "[4/5] Downloading QuickTunnel client..."
-$localBinary = "$env:TEMP\quicktunnel.exe"
-Write-Host "      Downloading client binary (may take 30-60s)..."
-if (Test-Path "$env:TEMP\quicktunnel.exe") { Remove-Item "$env:TEMP\quicktunnel.exe" -Force }
-Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
-
-$retries = 3
+# ── Download QuickTunnel binary ───────────────────────────────────────────────
+Write-Host "[4/6] Downloading QuickTunnel binary..."
 $downloaded = $false
-for ($i = 1; $i -le $retries; $i++) {
+for ($i = 1; $i -le 3; $i++) {
     try {
-        Invoke-WebRequest -Uri $DownloadURL -OutFile $localBinary -UseBasicParsing -TimeoutSec 300
+        Invoke-WebRequest -Uri $DownloadURL -OutFile $BinaryPath -UseBasicParsing -TimeoutSec 300
         $downloaded = $true
-        Write-Host "      ✓ Downloaded successfully"
+        Write-Host "      Saved to $BinaryPath"
         break
     } catch {
-        Write-Host "      Download attempt $i/$retries failed"
-        if ($i -lt $retries) {
-            Write-Host "      Retrying in 5 seconds..."
-            Start-Sleep -Seconds 5
-        }
+        Write-Host "      Attempt $i/3 failed. Retrying..."
+        Start-Sleep -Seconds 5
     }
 }
-
-if ($downloaded) {
-    Copy-Item $localBinary -Destination $BinaryPath -Force
-} else {
-    Write-Host "ERROR: Failed to download QuickTunnel after $retries attempts" -ForegroundColor Red
+if (-not $downloaded) {
+    Write-Error "Failed to download QuickTunnel binary after 3 attempts."
     exit 1
 }
 
+# Add to PATH
 if ($env:PATH -notlike "*QuickTunnel*") {
-    try {
-        $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
-        if ($currentPath -notlike "*$QtDir*") {
-            [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$QtDir", "Machine")
-        }
-    } catch { }
     $env:PATH += ";$QtDir"
+    try { [Environment]::SetEnvironmentVariable("PATH", [Environment]::GetEnvironmentVariable("PATH","Machine")+";$QtDir", "Machine") } catch {}
 }
 
-Write-Host "[5/5] Joining network $NetworkID and installing service..."
-& $BinaryPath join $ServerURL $NetworkID
-
+# ── Join network ──────────────────────────────────────────────────────────────
+Write-Host "[5/6] Joining network $NetworkID ..."
+Write-Host "      (This will save config and start tunnel)"
+Write-Host "      Press Ctrl+C after you see 'Tunnel UP' to continue setup"
 Write-Host ""
-Write-Host "Installing as Windows Service for auto-start..."
-& $BinaryPath install 2>&1 | Where-Object { -not ($_ -like "*error*") } | Out-Null
 
-Write-Host "Verifying startup task..."
-schtasks /query /tn QuickTunnel 1>$null 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "✓ Startup task installed"
-} else {
-    Write-Host "⚠ Startup task missing. Run: quicktunnel install" -ForegroundColor Yellow
+# Start join in background, wait for config
+$job = Start-Job -ScriptBlock {
+    param($bin, $srv, $net)
+    & $bin join $srv $net
+} -ArgumentList $BinaryPath, $ServerURL, $NetworkID
+
+# Wait up to 60s for config file
+$configPath = "$env:USERPROFILE\.quicktunnel\config.json"
+$waited = 0
+Write-Host "      Waiting for config..." -NoNewline
+while (-not (Test-Path $configPath) -and $waited -lt 60) {
+    Start-Sleep -Seconds 2
+    $waited += 2
+    Write-Host "." -NoNewline
 }
+Write-Host ""
+
+if (Test-Path $configPath) {
+    Write-Host "      Config saved: $configPath"
+} else {
+    Write-Host "      [WARN] Config not found, running join directly..."
+    & $BinaryPath join $ServerURL $NetworkID
+}
+
+# ── Install as Windows Scheduled Task (runs on login + after reboot) ──────────
+Write-Host "[6/6] Installing auto-start task..."
+
+$action  = New-ScheduledTaskAction -Execute $BinaryPath -Argument "up" -WorkingDirectory $QtDir
+$triggers = @(
+    $(New-ScheduledTaskTrigger -AtLogOn),
+    $(New-ScheduledTaskTrigger -AtStartup)
+)
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "SYSTEM" `
+    -LogonType ServiceAccount `
+    -RunLevel Highest
+
+try {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $triggers `
+        -Settings $settings `
+        -Principal $principal `
+        -Force | Out-Null
+    Write-Host "      Auto-start task installed (runs as SYSTEM on boot + login)"
+} catch {
+    Write-Host "      [WARN] Could not install as SYSTEM, trying current user..."
+    $principal2 = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -RunLevel Highest
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal2 -Force | Out-Null
+    Write-Host "      Auto-start task installed (current user)"
+}
+
+# Start the task now
+Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════"
-Write-Host "✓ QuickTunnel is ready!"
+Write-Host "✓ QuickTunnel installed and running!" -ForegroundColor Green
+Write-Host "  Network : $NetworkID"
+Write-Host "  Binary  : $BinaryPath"
 Write-Host "═══════════════════════════════════════════════"
 Write-Host ""
 Write-Host "Commands:"
-Write-Host "  quicktunnel status       - check connection"
-Write-Host "  quicktunnel peers        - list connected peers"
-Write-Host "  schtasks /query /tn QuickTunnel - task status"
+Write-Host "  quicktunnel status              - connection info"
+Write-Host "  quicktunnel peers               - list peers"
+Write-Host "  Get-ScheduledTask QuickTunnel   - task status"
 Write-Host ""
-Write-Host "Service will auto-start on reboot."
+Write-Host "Auto-starts on every reboot and login." -ForegroundColor Cyan
 Write-Host ""
 `, serverURL, networkID, serverURL, networkID)
 }
