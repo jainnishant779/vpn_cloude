@@ -118,7 +118,9 @@ SERVER_URL="%s"
 BINARY="/usr/local/bin/quicktunnel"
 SERVICE_NAME="quicktunnel"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-CONFIG_DIR="/etc/quicktunnel"
+CONFIG_DIR_SYS="/etc/quicktunnel"
+CONFIG_DIR_HOME="/root/.quicktunnel"
+JOIN_LOG="/var/log/quicktunnel-join.log"
 %s
 
 # Must be root (we write to /usr/local/bin and /etc/systemd/system)
@@ -185,10 +187,53 @@ fi
 chmod +x "$BINARY"
 echo "      Saved: $BINARY"
 
-# ── 5. Join the network (fetch config only) ──────────────────────────────────
+# ── 5. Join the network (wait for approval + config) ─────────────────────────
 echo "[4/6] Joining network $NETWORK_ID ..."
-mkdir -p "$CONFIG_DIR"
-"$BINARY" join "$SERVER_URL" "$NETWORK_ID"
+mkdir -p "$CONFIG_DIR_SYS"
+mkdir -p "$CONFIG_DIR_HOME"
+
+HOME=/root "$BINARY" join "$SERVER_URL" "$NETWORK_ID" >"$JOIN_LOG" 2>&1 &
+JOIN_PID=$!
+
+config_found() {
+    [ -f "$CONFIG_DIR_SYS/config.json" ] || \
+    [ -f "$CONFIG_DIR_HOME/config.json" ] || \
+    [ -f "/root/.quicktunnel/config.json" ]
+}
+
+echo -n "      Waiting for approval..."
+JOIN_WAIT=0
+while [ $JOIN_WAIT -lt 300 ]; do
+    if config_found; then
+        break
+    fi
+    if ! kill -0 "$JOIN_PID" 2>/dev/null; then
+        echo ""
+        echo "ERROR: join exited before config was created."
+        echo "--- Last 50 lines of join log ---"
+        tail -n 50 "$JOIN_LOG" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 2
+    JOIN_WAIT=$((JOIN_WAIT + 2))
+    echo -n "."
+done
+echo ""
+
+if ! config_found; then
+    echo "ERROR: join timed out after 5 minutes."
+    echo "       Approve the member in dashboard and rerun installer."
+    echo "--- Last 50 lines of join log ---"
+    tail -n 50 "$JOIN_LOG" 2>/dev/null || true
+    exit 1
+fi
+
+echo "✓ Join successful"
+if kill -0 "$JOIN_PID" 2>/dev/null; then
+    kill -TERM "$JOIN_PID" 2>/dev/null || true
+    sleep 2
+    kill -KILL "$JOIN_PID" 2>/dev/null || true
+fi
 
 # ── 6. Write systemd unit file ───────────────────────────────────────────────
 echo "[5/6] Installing systemd service..."
@@ -201,6 +246,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=HOME=/root
 ExecStart=$BINARY up
 Restart=always
 RestartSec=5
