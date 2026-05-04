@@ -110,29 +110,38 @@ fi`, serverURL)
 	}
 
 	return fmt.Sprintf(`#!/usr/bin/env bash
-# QuickTunnel — zero-touch installer + service setup
+# QuickTunnel — zero-touch installer + systemd service setup
 # Usage: curl %s/join/<network_id> | sudo bash
 set -euo pipefail
 
 SERVER_URL="%s"
 BINARY="/usr/local/bin/quicktunnel"
 SERVICE_NAME="quicktunnel"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+CONFIG_DIR="/etc/quicktunnel"
 %s
+
+# Must be root (we write to /usr/local/bin and /etc/systemd/system)
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: This installer must be run as root (use sudo)."
+    exit 1
+fi
 
 # ── 1. Platform detection ─────────────────────────────────────────────────────
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
-  x86_64)        ARCH="amd64" ;;
-  aarch64|arm64) ARCH="arm64" ;;
-  armv7*|armv6*) ARCH="armv7" ;;
-  *) echo "Unsupported arch: $ARCH_RAW"; exit 1 ;;
+    x86_64)        ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    armv7*|armv6*) ARCH="armv7" ;;
+    *) echo "Unsupported arch: $ARCH_RAW"; exit 1 ;;
 esac
-echo "[1/5] Platform: $OS/$ARCH"
+echo "[1/6] Platform: $OS/$ARCH"
 
 # ── 2. Cleanup old instance ───────────────────────────────────────────────────
-echo "[2/5] Cleaning up..."
+echo "[2/6] Cleaning up old instance..."
 systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+systemctl disable "$SERVICE_NAME" 2>/dev/null || true
 pkill -f quicktunnel 2>/dev/null || true
 sleep 1
 ip link delete qtun0 2>/dev/null || true
@@ -141,90 +150,99 @@ rm -f "$BINARY"
 
 # ── 3. WireGuard kernel module ────────────────────────────────────────────────
 if [ "$OS" = "linux" ]; then
-  modprobe wireguard 2>/dev/null || true
-  if ! command -v wg &>/dev/null; then
-    apt-get install -y -qq wireguard-tools 2>/dev/null || \
-    yum install -y wireguard-tools 2>/dev/null || true
-  fi
+    modprobe wireguard 2>/dev/null || true
+    if ! command -v wg &>/dev/null; then
+        apt-get install -y -qq wireguard-tools 2>/dev/null || \
+        yum install -y wireguard-tools 2>/dev/null || \
+        dnf install -y wireguard-tools 2>/dev/null || \
+        apk add --no-cache wireguard-tools 2>/dev/null || true
+    fi
 fi
 
 # ── 4. Download binary ────────────────────────────────────────────────────────
 DOWNLOAD_URL="$SERVER_URL/api/v1/downloads/client/$OS/$ARCH"
-echo "[3/5] Downloading from $DOWNLOAD_URL ..."
+echo "[3/6] Downloading from $DOWNLOAD_URL ..."
 DOWNLOAD_SUCCESS=false
 for i in 1 2 3; do
-  if command -v curl &>/dev/null; then
-    if curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY"; then
-      DOWNLOAD_SUCCESS=true
-      break
+    if command -v curl &>/dev/null; then
+        if curl -fsSL --connect-timeout 15 --max-time 120 "$DOWNLOAD_URL" -o "$BINARY"; then
+            DOWNLOAD_SUCCESS=true
+            break
+        fi
+    elif command -v wget &>/dev/null; then
+        if wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL"; then
+            DOWNLOAD_SUCCESS=true
+            break
+        fi
     fi
-  elif command -v wget &>/dev/null; then
-    if wget -qO "$BINARY" --timeout=120 "$DOWNLOAD_URL"; then
-      DOWNLOAD_SUCCESS=true
-      break
-    fi
-  fi
-  echo "  Retry $i/3 ..."
-  sleep 3
+    echo "  Retry $i/3 ..."
+    sleep 3
 done
 if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
-  echo "ERROR: Failed to download QuickTunnel binary after 3 attempts."
-  exit 1
+    echo "ERROR: Failed to download QuickTunnel binary after 3 attempts."
+    exit 1
 fi
 chmod +x "$BINARY"
 echo "      Saved: $BINARY"
 
-# ── 5. Join + install systemd service ────────────────────────────────────────
-echo "[4/5] Joining network $NETWORK_ID ..."
+# ── 5. Join the network (fetch config only) ──────────────────────────────────
+echo "[4/6] Joining network $NETWORK_ID ..."
+mkdir -p "$CONFIG_DIR"
+"$BINARY" join "$SERVER_URL" "$NETWORK_ID"
 
-if ! timeout 30s "$BINARY" join "$SERVER_URL" "$NETWORK_ID"; then
-  echo "[WARN] Join command exited with an error or timed out."
-fi
-
-CONFIG_FILE="/root/.quicktunnel/config.json"
-if [ -n "${HOME:-}" ] && [ -f "$HOME/.quicktunnel/config.json" ]; then
-  CONFIG_FILE="$HOME/.quicktunnel/config.json"
-fi
-
-if [ ! -f "$CONFIG_FILE" ]; then
-  echo "ERROR: Config file not found at $CONFIG_FILE. Join may have failed."
-  exit 1
-fi
-
-echo "[5/5] Installing systemd service..."
-
-cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
+# ── 6. Write systemd unit file ───────────────────────────────────────────────
+echo "[5/6] Installing systemd service..."
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=QuickTunnel VPN
+Description=QuickTunnel mesh VPN client
+Documentation=$SERVER_URL
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/sbin/modprobe wireguard
-ExecStart=${BINARY} up
+ExecStart=$BINARY up
 Restart=always
-RestartSec=10
+RestartSec=5
 User=root
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+chmod 644 "$SERVICE_FILE"
+
+# ── 7. Reload, enable, and start ─────────────────────────────────────────────
+echo "[6/6] Enabling and starting service..."
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
-systemctl start "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+sleep 2
+
+# ── Verify ───────────────────────────────────────────────────────────────────
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+    STATUS="active ✓"
+else
+    STATUS="NOT running ✗ — check: journalctl -u $SERVICE_NAME -n 50"
+fi
 
 echo ""
 echo "═══════════════════════════════════════════════"
-echo "✓ QuickTunnel installed and running!"
-echo "  Virtual network: $NETWORK_ID"
-echo "  Service: systemctl status $SERVICE_NAME"
-echo "  Logs: journalctl -u $SERVICE_NAME -f"
-echo "  Peers: quicktunnel peers"
+echo "✓ QuickTunnel installed!"
+echo "  Virtual network : $NETWORK_ID"
+echo "  Service status  : $STATUS"
+echo "  Boot persistence: enabled (systemctl is-enabled $SERVICE_NAME)"
+echo "  Manage service  : systemctl {status|restart|stop} $SERVICE_NAME"
+echo "  Live logs       : journalctl -u $SERVICE_NAME -f"
+echo "  Peers           : quicktunnel peers"
 echo "═══════════════════════════════════════════════"
+echo ""
+echo "Terminal band karne pe bhi service chalti rahegi (systemd manage kar raha hai)."
 `, serverURL, serverURL, networkBlock)
 }
 
