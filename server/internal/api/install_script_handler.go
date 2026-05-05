@@ -152,7 +152,7 @@ rm -f "$BINARY"
 
 backup_config() {
     if [ -f "$1" ]; then
-        ts=$(date +%s)
+        ts=$(date +%%s)
         mv "$1" "$1.bak.$ts" 2>/dev/null || true
     fi
 }
