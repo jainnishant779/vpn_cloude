@@ -211,7 +211,7 @@ config_valid() {
     ! grep -q '"member_token":""' "$1" 2>/dev/null && \
     grep -q '"member_id"' "$1" 2>/dev/null && \
     ! grep -q '"member_id":""' "$1" 2>/dev/null && \
-    grep -Eq '"network_id"[[:space:]]*:[[:space:]]*"'"$NETWORK_ID"'"' "$1" 2>/dev/null
+    grep -Eq "\"network_id\"[[:space:]]*:[[:space:]]*\"$NETWORK_ID\"" "$1" 2>/dev/null
 }
 
 config_found() {
