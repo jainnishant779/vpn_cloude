@@ -150,6 +150,17 @@ ip link delete qtun0 2>/dev/null || true
 fuser -k 51820/udp 2>/dev/null || true
 rm -f "$BINARY"
 
+backup_config() {
+    if [ -f "$1" ]; then
+        ts=$(date +%s)
+        mv "$1" "$1.bak.$ts" 2>/dev/null || true
+    fi
+}
+
+backup_config "$CONFIG_DIR_SYS/config.json"
+backup_config "$CONFIG_DIR_HOME/config.json"
+backup_config "/root/.quicktunnel/config.json"
+
 # ── 3. WireGuard kernel module ────────────────────────────────────────────────
 if [ "$OS" = "linux" ]; then
     modprobe wireguard 2>/dev/null || true
@@ -195,10 +206,12 @@ mkdir -p "$CONFIG_DIR_HOME"
 # Function to verify config has required fields
 config_valid() {
     if [ ! -f "$1" ]; then return 1; fi
-    # Check for member_token and virtual_ip in config
+    # Check for member_token, member_id, and expected network_id in config
     grep -q '"member_token"' "$1" 2>/dev/null && \
-    grep -q '"virtual_ip"' "$1" 2>/dev/null && \
-    ! grep -q '"member_token":""' "$1" 2>/dev/null
+    ! grep -q '"member_token":""' "$1" 2>/dev/null && \
+    grep -q '"member_id"' "$1" 2>/dev/null && \
+    ! grep -q '"member_id":""' "$1" 2>/dev/null && \
+    grep -Eq '"network_id"[[:space:]]*:[[:space:]]*"'"$NETWORK_ID"'"' "$1" 2>/dev/null
 }
 
 config_found() {
@@ -220,7 +233,7 @@ while [ $JOIN_ATTEMPT -lt $MAX_ATTEMPTS ]; do
 
     echo -n "      Waiting for approval..."
     JOIN_WAIT=0
-    MAX_WAIT=180  # Increased from 300 to 180 seconds (3 minutes)
+    MAX_WAIT=180  # 3 minutes
     while [ $JOIN_WAIT -lt $MAX_WAIT ]; do
         if config_found; then
             echo ""
@@ -382,6 +395,13 @@ Stop-Process -Name "quicktunnel" -Force -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
+# Backup existing config to avoid stale joins
+if (Test-Path $ConfigFile) {
+    $backup = "$ConfigFile.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+    Move-Item -Path $ConfigFile -Destination $backup -Force
+    Write-Host "      Existing config backed up to $backup"
+}
+
 # ── 3. Install WireGuard ─────────────────────────────────────────────────────
 Write-Host "[3/7] Installing WireGuard..."
 if (-not (Test-Path "$WGPath\wireguard.exe")) {
@@ -474,8 +494,10 @@ function Test-ConfigValid {
     if (-not (Test-Path $Path)) { return $false }
     try {
         $cfg = Get-Content $Path -Raw | ConvertFrom-Json
-        # Check for member_token (authentication) and virtual_ip
-        return ($null -ne $cfg.member_token -and $null -ne $cfg.virtual_ip)
+        if ([string]::IsNullOrWhiteSpace($cfg.member_token)) { return $false }
+        if ([string]::IsNullOrWhiteSpace($cfg.member_id)) { return $false }
+        if ($cfg.network_id -ne $NetworkID) { return $false }
+        return ($null -ne $cfg.virtual_ip)
     } catch {
         return $false
     }
@@ -550,6 +572,14 @@ if (-not $joinSuccess) {
 
 if (Test-Path $ConfigFile) {
     $cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    if ($cfg.network_id -ne $NetworkID) {
+        Write-Error "Config network_id mismatch. Expected $NetworkID, got $($cfg.network_id)"
+        exit 1
+    }
+    if ([string]::IsNullOrWhiteSpace($cfg.member_token) -or [string]::IsNullOrWhiteSpace($cfg.member_id)) {
+        Write-Error "Config missing member credentials. Rerun installer."
+        exit 1
+    }
     Write-Host "      Member ID  : $($cfg.member_id)"
     Write-Host "      Virtual IP : $($cfg.virtual_ip)"
 } else {

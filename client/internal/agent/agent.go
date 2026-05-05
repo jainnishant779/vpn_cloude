@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"runtime"
 	"strconv"
 	"strings"
@@ -376,13 +378,23 @@ func (a *Agent) sendMemberHeartbeat() error {
 	}
 
 	stats := a.tunnel.GetStats()
-	return a.apiClient.MemberHeartbeat(memberID, api_client.MemberHeartbeatRequest{
+	err = a.apiClient.MemberHeartbeat(memberID, api_client.MemberHeartbeatRequest{
 		PublicEndpoint: endpoint,
 		LocalEndpoints: localEndpoints,
 		VNCAvailable:   vncAvail,
 		RXBytes:        int64(stats.RXBytes),
 		TXBytes:        int64(stats.TXBytes),
 	})
+	if err != nil {
+		var httpErr *api_client.HTTPError
+		if errors.As(err, &httpErr) {
+			if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
+				log.Warn().Str("detail", httpErr.Message).Msg("member heartbeat unauthorized; check member_token and config")
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *Agent) sendHeartbeat() error {

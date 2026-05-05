@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -347,6 +348,19 @@ func runDown(args []string) error {
 	return nil
 }
 
+func formatPeerAuthError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var httpErr *api_client.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
+			return "unauthorized (member_token invalid or config mismatch)"
+		}
+	}
+	return err.Error()
+}
+
 func runStatus(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -370,8 +384,12 @@ func runStatus(args []string) error {
 	if cfg.MemberToken != "" {
 		c := api_client.NewClient(cfg.ServerURL, "")
 		c.SetMemberToken(cfg.MemberToken)
-		if peers, err := c.MemberGetPeers(cfg.MemberID); err == nil {
+		if strings.TrimSpace(cfg.MemberID) == "" {
+			out["peers_error"] = "member_id missing in config"
+		} else if peers, err := c.MemberGetPeers(cfg.MemberID); err == nil {
 			out["peers_online"] = len(peers)
+		} else {
+			out["peers_error"] = formatPeerAuthError(err)
 		}
 	} else if cfg.APIKey != "" {
 		c := api_client.NewClient(cfg.ServerURL, cfg.APIKey)
@@ -392,7 +410,7 @@ func runPeers(args []string) error {
 		c.SetMemberToken(cfg.MemberToken)
 		peers, err := c.MemberGetPeers(cfg.MemberID)
 		if err != nil {
-			return fmt.Errorf("peers: %w", err)
+			return fmt.Errorf("peers: %s", formatPeerAuthError(err))
 		}
 		return printJSON(peers)
 	}

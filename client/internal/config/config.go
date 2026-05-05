@@ -102,9 +102,29 @@ func ConfigPath() (string, error) {
 }
 
 func applyEnvOverrides(cfg *Config) {
-	if v := env("SERVER_URL"); v != "" { cfg.ServerURL = v }
+	useMemberToken := strings.TrimSpace(cfg.MemberToken) != "" ||
+		strings.TrimSpace(cfg.MemberID) != "" ||
+		strings.TrimSpace(cfg.WGPrivateKey) != ""
+
+	if v := env("SERVER_URL"); v != "" {
+		if useMemberToken {
+			if strings.TrimSpace(cfg.ServerURL) != "" && strings.TrimSpace(cfg.ServerURL) != v {
+				fmt.Fprintf(os.Stderr, "warning: SERVER_URL env override ignored because member_token config is present\n")
+			}
+		} else {
+			cfg.ServerURL = v
+		}
+	}
 	if v := env("API_KEY"); v != "" { cfg.APIKey = v }
-	if v := env("NETWORK_ID"); v != "" { cfg.NetworkID = v }
+	if v := env("NETWORK_ID"); v != "" {
+		if useMemberToken {
+			if strings.TrimSpace(cfg.NetworkID) != "" && strings.TrimSpace(cfg.NetworkID) != v {
+				fmt.Fprintf(os.Stderr, "warning: NETWORK_ID env override ignored because member_token config is present\n")
+			}
+		} else {
+			cfg.NetworkID = v
+		}
+	}
 	if v := env("DEVICE_NAME"); v != "" { cfg.DeviceName = v }
 	if v := env("LOG_LEVEL"); v != "" { cfg.LogLevel = v }
 	if v := env("STUN_SERVER"); v != "" { cfg.STUNServer = v }
