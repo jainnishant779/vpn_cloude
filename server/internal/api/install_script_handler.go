@@ -192,48 +192,92 @@ echo "[4/6] Joining network $NETWORK_ID ..."
 mkdir -p "$CONFIG_DIR_SYS"
 mkdir -p "$CONFIG_DIR_HOME"
 
-HOME=/root "$BINARY" join "$SERVER_URL" "$NETWORK_ID" >"$JOIN_LOG" 2>&1 &
-JOIN_PID=$!
-
-config_found() {
-    [ -f "$CONFIG_DIR_SYS/config.json" ] || \
-    [ -f "$CONFIG_DIR_HOME/config.json" ] || \
-    [ -f "/root/.quicktunnel/config.json" ]
+# Function to verify config has required fields
+config_valid() {
+    if [ ! -f "$1" ]; then return 1; fi
+    # Check for member_token and virtual_ip in config
+    grep -q '"member_token"' "$1" 2>/dev/null && \
+    grep -q '"virtual_ip"' "$1" 2>/dev/null && \
+    ! grep -q '"member_token":""' "$1" 2>/dev/null
 }
 
-echo -n "      Waiting for approval..."
-JOIN_WAIT=0
-while [ $JOIN_WAIT -lt 300 ]; do
+config_found() {
+    [ -f "$CONFIG_DIR_SYS/config.json" ] && config_valid "$CONFIG_DIR_SYS/config.json" && return 0
+    [ -f "$CONFIG_DIR_HOME/config.json" ] && config_valid "$CONFIG_DIR_HOME/config.json" && return 0
+    [ -f "/root/.quicktunnel/config.json" ] && config_valid "/root/.quicktunnel/config.json" && return 0
+    return 1
+}
+
+# Join with retry logic
+JOIN_ATTEMPT=0
+MAX_ATTEMPTS=3
+while [ $JOIN_ATTEMPT -lt $MAX_ATTEMPTS ]; do
+    JOIN_ATTEMPT=$((JOIN_ATTEMPT + 1))
+    echo "      Join attempt $JOIN_ATTEMPT of $MAX_ATTEMPTS..."
+    
+    HOME=/root "$BINARY" join "$SERVER_URL" "$NETWORK_ID" >"$JOIN_LOG" 2>&1 &
+    JOIN_PID=$!
+
+    echo -n "      Waiting for approval..."
+    JOIN_WAIT=0
+    MAX_WAIT=180  # Increased from 300 to 180 seconds (3 minutes)
+    while [ $JOIN_WAIT -lt $MAX_WAIT ]; do
+        if config_found; then
+            echo ""
+            echo "      ✓ Join successful (config created)"
+            kill -TERM "$JOIN_PID" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$JOIN_PID" 2>/dev/null || true
+            break 2  # Break both loops
+        fi
+        if ! kill -0 "$JOIN_PID" 2>/dev/null; then
+            echo ""
+            break  # Process exited, try again
+        fi
+        sleep 2
+        JOIN_WAIT=$((JOIN_WAIT + 2))
+        echo -n "."
+    done
+
+    if ! kill -0 "$JOIN_PID" 2>/dev/null; then
+        wait "$JOIN_PID" 2>/dev/null
+    else
+        kill -TERM "$JOIN_PID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$JOIN_PID" 2>/dev/null || true
+    fi
+    
     if config_found; then
         break
+    elif [ $JOIN_ATTEMPT -lt $MAX_ATTEMPTS ]; then
+        echo "      Retrying in 5 seconds..."
+        sleep 5
     fi
-    if ! kill -0 "$JOIN_PID" 2>/dev/null; then
-        echo ""
-        echo "ERROR: join exited before config was created."
-        echo "--- Last 50 lines of join log ---"
-        tail -n 50 "$JOIN_LOG" 2>/dev/null || true
-        exit 1
-    fi
-    sleep 2
-    JOIN_WAIT=$((JOIN_WAIT + 2))
-    echo -n "."
 done
-echo ""
 
 if ! config_found; then
-    echo "ERROR: join timed out after 5 minutes."
-    echo "       Approve the member in dashboard and rerun installer."
-    echo "--- Last 50 lines of join log ---"
-    tail -n 50 "$JOIN_LOG" 2>/dev/null || true
+    echo ""
+    echo "ERROR: Join failed after $MAX_ATTEMPTS attempts."
+    echo ""
+    echo "Troubleshooting:"
+    echo "  1. Check dashboard - approve member if pending"
+    echo "  2. Verify server is reachable: ping $(echo "$SERVER_URL" | sed 's|.*://||; s|:.*||')"
+    echo "  3. Check firewall rules"
+    echo ""
+    echo "Last 30 lines of join log:"
+    tail -n 30 "$JOIN_LOG" 2>/dev/null || true
     exit 1
 fi
 
-echo "✓ Join successful"
-if kill -0 "$JOIN_PID" 2>/dev/null; then
-    kill -TERM "$JOIN_PID" 2>/dev/null || true
-    sleep 2
-    kill -KILL "$JOIN_PID" 2>/dev/null || true
+# Show config details
+if [ -f "$CONFIG_DIR_SYS/config.json" ]; then
+    CONFIG_FOUND="$CONFIG_DIR_SYS/config.json"
+elif [ -f "$CONFIG_DIR_HOME/config.json" ]; then
+    CONFIG_FOUND="$CONFIG_DIR_HOME/config.json"
+else
+    CONFIG_FOUND="/root/.quicktunnel/config.json"
 fi
+echo "✓ Config: $CONFIG_FOUND"
 
 # ── 6. Write systemd unit file ───────────────────────────────────────────────
 echo "[5/6] Installing systemd service..."
@@ -424,33 +468,92 @@ if (-not (Test-Path $NssmPath)) {
 # ── 6. Join network ──────────────────────────────────────────────────────────
 Write-Host "[6/7] Joining network $NetworkID ..."
 
-$joinProc = Start-Process -FilePath $BinaryPath -ArgumentList "join", $ServerURL, $NetworkID -PassThru -NoNewWindow -RedirectStandardOutput "$QtDir\join_stdout.log" -RedirectStandardError "$QtDir\join_stderr.log"
-
-$waited = 0
-Write-Host "      Waiting for config..." -NoNewline
-while ($waited -lt 60) {
-    Start-Sleep -Seconds 2
-    $waited += 2
-    Write-Host "." -NoNewline
-    if (Test-Path $ConfigFile) { break }
-    if ($joinProc.HasExited) { break }
+# Function to verify config has required fields
+function Test-ConfigValid {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $cfg = Get-Content $Path -Raw | ConvertFrom-Json
+        # Check for member_token (authentication) and virtual_ip
+        return ($null -ne $cfg.member_token -and $null -ne $cfg.virtual_ip)
+    } catch {
+        return $false
+    }
 }
-Write-Host ""
 
-if (-not $joinProc.HasExited) {
-    Stop-Process -Id $joinProc.Id -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
+# Retry loop for join
+$joinSuccess = $false
+$joinAttempt = 0
+$maxAttempts = 3
+
+while ($joinAttempt -lt $maxAttempts -and -not $joinSuccess) {
+    $joinAttempt++
+    Write-Host "      Join attempt $joinAttempt of $maxAttempts..."
+    
+    $joinProc = Start-Process -FilePath $BinaryPath -ArgumentList "join", $ServerURL, $NetworkID -PassThru -NoNewWindow -RedirectStandardOutput "$QtDir\join_stdout.log" -RedirectStandardError "$QtDir\join_stderr.log"
+
+    $waited = 0
+    $maxWait = 180  # Increased from 60 to 180 seconds (3 minutes for approval)
+    Write-Host "      Waiting for approval..." -NoNewline
+    
+    while ($waited -lt $maxWait) {
+        Start-Sleep -Seconds 2
+        $waited += 2
+        Write-Host "." -NoNewline
+        
+        if (Test-ConfigValid $ConfigFile) {
+            Write-Host ""
+            Write-Host "      ✓ Config created with valid credentials" -ForegroundColor Green
+            $joinSuccess = $true
+            break
+        }
+        
+        if ($joinProc.HasExited) {
+            Write-Host ""
+            Write-Host "      [!] Join process exited unexpectedly" -ForegroundColor Yellow
+            break
+        }
+    }
+    
+    if (-not $joinProc.HasExited) {
+        Stop-Process -Id $joinProc.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
+    
+    if ($joinSuccess) {
+        Write-Host "      ✓ Join successful"
+        break
+    } elseif ($joinAttempt -lt $maxAttempts) {
+        Write-Host "      Retrying in 5 seconds..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 5
+    }
+}
+
+# Final verification
+if (-not $joinSuccess) {
+    Write-Host ""
+    Write-Host "      [!] Failed to join network after $maxAttempts attempts" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "      Troubleshooting:" -ForegroundColor Yellow
+    Write-Host "        1. Check dashboard - approve member if pending"
+    Write-Host "        2. Verify network is reachable: Test-NetConnection $ServerURL"
+    Write-Host "        3. Check firewall rules"
+    Write-Host ""
+    Write-Host "      Join stdout:" -ForegroundColor Cyan
+    if (Test-Path "$QtDir\join_stdout.log") { Get-Content "$QtDir\join_stdout.log" | Select-Object -Last 30 }
+    Write-Host ""
+    Write-Host "      Join stderr:" -ForegroundColor Cyan
+    if (Test-Path "$QtDir\join_stderr.log") { Get-Content "$QtDir\join_stderr.log" | Select-Object -Last 30 }
+    Write-Error "Join failed. Rerun installer after resolving issue."
+    exit 1
 }
 
 if (Test-Path $ConfigFile) {
-    Write-Host "      Config saved: $ConfigFile"
+    $cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    Write-Host "      Member ID  : $($cfg.member_id)"
+    Write-Host "      Virtual IP : $($cfg.virtual_ip)"
 } else {
-    Write-Host "      [!] Config not found at $ConfigFile" -ForegroundColor Red
-    Write-Host "      Join stdout:" -ForegroundColor Yellow
-    if (Test-Path "$QtDir\join_stdout.log") { Get-Content "$QtDir\join_stdout.log" }
-    Write-Host "      Join stderr:" -ForegroundColor Yellow
-    if (Test-Path "$QtDir\join_stderr.log") { Get-Content "$QtDir\join_stderr.log" }
-    Write-Error "Join failed. Check logs above."
+    Write-Error "Config file missing after successful join."
     exit 1
 }
 
